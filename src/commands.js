@@ -1,8 +1,8 @@
-
 import { InlineKeyboard } from "grammy"
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free"
+const OWNER_ID = Number(process.env.OWNER_ID)
 
 const conversations = new Map()
 const MAX_HISTORY = 20
@@ -21,13 +21,68 @@ const SYSTEM_PROMPT = `
 - Не повторяй вопрос пользователя без необходимости.
 `
 
+// Общая функция запроса к ИИ: используется и в личке с ботом, и в бизнес-чатах.
+async function askAI(key, userText) {
+  const apiKey = process.env.OPENROUTER_API_KEY
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY не настроен в FadeHost.")
+
+  const history = conversations.get(key) || []
+  history.push({ role: "user", content: userText })
+
+  try {
+    const response = await fetch(OPENROUTER_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...history.slice(-MAX_HISTORY),
+        ],
+        temperature: 0.7,
+        max_tokens: 1000,
+      }),
+      signal: AbortSignal.timeout(60000),
+    })
+
+    const data = await response.json()
+
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `OpenRouter HTTP ${response.status}`)
+    }
+
+    const answer = data?.choices?.[0]?.message?.content
+    const answerText =
+      typeof answer === "string"
+        ? answer
+        : Array.isArray(answer)
+          ? answer.map((part) => part.text || "").join("")
+          : ""
+
+    if (!answerText.trim()) throw new Error("Модель вернула пустой ответ.")
+
+    history.push({ role: "assistant", content: answerText })
+    conversations.set(key, history.slice(-MAX_HISTORY))
+    return answerText
+  } catch (error) {
+    history.pop()
+    if (history.length) conversations.set(key, history)
+    else conversations.delete(key)
+    throw error
+  }
+}
+
+// Telegram ограничивает длину одного сообщения.
+const split = (text) => text.match(/[\s\S]{1,4000}/g) || []
+
 export function registerCommands(bot) {
   bot.command("start", (ctx) =>
     ctx.reply(
       `Привет, ${ctx.from?.first_name ?? "друг"}! Я ИИ-ассистент. Напиши мне что-нибудь, и мы начнём общаться.`,
-      {
-        reply_markup: new InlineKeyboard().text("Проверить связь", "ping"),
-      },
+      { reply_markup: new InlineKeyboard().text("Проверить связь", "ping") },
     ),
   )
 
@@ -50,14 +105,11 @@ export function registerCommands(bot) {
   bot.command("ping", (ctx) => ctx.reply("Pong! Бот работает."))
 
   bot.command("id", (ctx) =>
-    ctx.reply(
-      `Chat ID: ${ctx.chat.id}\nYour ID: ${ctx.from?.id ?? "unknown"}`,
-    ),
+    ctx.reply(`Chat ID: ${ctx.chat.id}\nYour ID: ${ctx.from?.id ?? "unknown"}`),
   )
 
   bot.command("reset", (ctx) => {
-    const key = `${ctx.chat.id}:${ctx.from.id}`
-    conversations.delete(key)
+    conversations.delete(`${ctx.chat.id}:${ctx.from.id}`)
     return ctx.reply("Память диалога очищена. Начинаем с чистого листа!")
   })
 
@@ -65,97 +117,50 @@ export function registerCommands(bot) {
     await ctx.answerCallbackQuery({ text: "Pong!" })
   })
 
+  // Обычные сообщения боту в личке.
   bot.on("message:text", async (ctx) => {
-    const apiKey = process.env.OPENROUTER_API_KEY
-
-    if (!apiKey) {
-      return ctx.reply("Ошибка: OPENROUTER_API_KEY не настроен в FadeHost.")
-    }
-
     const userText = ctx.message.text.trim()
     if (!userText) return
 
     const key = `${ctx.chat.id}:${ctx.from.id}`
-    const history = conversations.get(key) || []
-
-    history.push({
-      role: "user",
-      content: userText,
-    })
 
     try {
       await ctx.replyWithChatAction("typing")
-
-      const response = await fetch(OPENROUTER_API_URL, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            {
-              role: "system",
-              content: SYSTEM_PROMPT,
-            },
-            ...history.slice(-MAX_HISTORY),
-          ],
-          temperature: 0.7,
-          max_tokens: 1000,
-        }),
-        signal: AbortSignal.timeout(60000),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(
-          data?.error?.message || `OpenRouter HTTP ${response.status}`,
-        )
-      }
-
-      const answer = data?.choices?.[0]?.message?.content
-
-      const answerText = typeof answer === "string"
-        ? answer
-        : Array.isArray(answer)
-          ? answer.map((part) => part.text || "").join("")
-          : ""
-
-      if (!answerText.trim()) {
-        throw new Error("Модель вернула пустой ответ.")
-      }
-
-      history.push({
-        role: "assistant",
-        content: answerText,
-      })
-
-      conversations.set(key, history.slice(-MAX_HISTORY))
-
-      // Telegram ограничивает длину одного сообщения.
-      const chunks = answerText.match(/[\s\S]{1,4000}/g) || []
-
-      for (const chunk of chunks) {
-        await ctx.reply(chunk)
-      }
-
+      const answer = await askAI(key, userText)
+      for (const chunk of split(answer)) await ctx.reply(chunk)
     } catch (error) {
-      history.pop()
-
-      if (history.length) {
-        conversations.set(key, history)
-      } else {
-        conversations.delete(key)
-      }
-
       console.error("[OpenRouter error]", error.message)
-
       await ctx.reply(
         "Не удалось получить ответ от ИИ. Попробуй немного позже.\n\n" +
-        `Причина: ${error.message.slice(0, 250)}`,
+          `Причина: ${error.message.slice(0, 250)}`,
       )
+    }
+  })
+
+  // Сообщения из чатов, подключённых через Secretary Mode (business).
+  bot.on("business_message:text", async (ctx) => {
+    // Свои же сообщения владельца тоже приходят сюда: на них не отвечаем.
+    if (ctx.from?.id === OWNER_ID) return
+
+    const userText = ctx.businessMessage?.text?.trim() || ctx.message?.text?.trim()
+    if (!userText) return
+
+    const connectionId = ctx.businessConnectionId
+    const key = `biz:${ctx.chat.id}`
+
+    try {
+      await ctx.api.sendChatAction(ctx.chat.id, "typing", {
+        business_connection_id: connectionId,
+      })
+      const answer = await askAI(key, userText)
+      for (const chunk of split(answer)) {
+        await ctx.api.sendMessage(ctx.chat.id, chunk, {
+          business_connection_id: connectionId,
+        })
+      }
+    } catch (error) {
+      // В чужом чате про ошибки не пишем, только в лог.
+      console.error("[business chat error]", error.message)
     }
   })
 }
