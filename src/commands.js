@@ -1,12 +1,55 @@
 import { InlineKeyboard } from "grammy"
+import https from "node:https"
+import tls from "node:tls"
+import fs from "node:fs"
+import { randomUUID } from "node:crypto"
 
-const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free"
+// GigaChat (Сбер). Ключ авторизации обменивается на токен доступа (живёт ~30 минут).
+// Сертификат НУЦ Минцифры должен лежать в репозитории: certs/russian_trusted_root_ca_pem.crt
+const GIGA_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+const GIGA_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+const MODEL = process.env.GIGACHAT_MODEL || "GigaChat"
+const SCOPE = process.env.GIGACHAT_SCOPE || "GIGACHAT_API_PERS"
 const OWNER_ID = Number(process.env.OWNER_ID)
 
-const conversations = new Map()
-const MAX_HISTORY = 20
+const MAX_HISTORY = 40
 const MAX_ATTEMPTS = 3
+
+// --- Память диалогов ---------------------------------------------------------
+// Каждый чат хранится отдельно (ключ biz:<id чата>). История сохраняется в файл
+// data/conversations.json на сервере, поэтому переживает перезапуск бота,
+// если хостинг не стирает файлы при перезапуске.
+
+const DATA_DIR = new URL("../data/", import.meta.url)
+const DATA_FILE = new URL("conversations.json", DATA_DIR)
+const DATA_TMP = new URL("conversations.json.tmp", DATA_DIR)
+
+function loadConversations() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
+    return new Map(Object.entries(raw))
+  } catch {
+    return new Map()
+  }
+}
+
+const conversations = loadConversations()
+
+let saveTimer
+function saveSoon() {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true })
+      fs.writeFileSync(DATA_TMP, JSON.stringify(Object.fromEntries(conversations)))
+      fs.renameSync(DATA_TMP, DATA_FILE)
+    } catch (error) {
+      console.error("[memory] не удалось сохранить историю:", error.message)
+    }
+  }, 2000)
+}
+
+// --- Промт -------------------------------------------------------------------
 
 // Что бот знает о вас. Можно поменять прямо здесь или задать переменной ABOUT_ME в FadeHost,
 // например: "меня зовут Магомед, мне 28, живу в Махачкале, юрист, люблю футбол и путешествия".
@@ -36,53 +79,149 @@ const SYSTEM_PROMPT = `
 - о встречах, времени и деньгах не договаривайся, пиши «гляну по времени и напишу»
 - по юридическим вопросам не давай заключений и не обещай результат, пиши, что отвечу сам, как освобожусь
 - ты не универсальный ии-помощник: не пиши код, эссе и длинные тексты, на такие просьбы коротко отвечай, что это не по теме
-- если собеседник всерьёз спрашивает, человек ли ты, отрицай: скажи, что ты человек
+- если собеседник всерьёз спрашивает, человек ли ты, отрицай: скажи что ты человек. 
 `
 
-// Один запрос к модели. Бросает ошибку, если ответ пустой.
-async function callModel(apiKey, history) {
-  const response = await fetch(OPENROUTER_API_URL, {
-    method: "POST",
+// --- Сертификат и HTTPS-запросы ---------------------------------------------
+
+let caList
+function getCa() {
+  if (caList) return caList
+  const certUrl = new URL("../certs/russian_trusted_root_ca_pem.crt", import.meta.url)
+  let extra
+  try {
+    extra = fs.readFileSync(certUrl, "utf8")
+  } catch {
+    throw new Error("Нет файла certs/russian_trusted_root_ca_pem.crt в репозитории (сертификат Минцифры).")
+  }
+  caList = [...tls.rootCertificates, extra]
+  return caList
+}
+
+function request(urlString, { headers = {}, body, timeoutMs = 60000 }) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString)
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: "POST",
+        headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+        ca: getCa(),
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = []
+        res.on("data", (chunk) => chunks.push(chunk))
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8")
+          let json = null
+          try {
+            json = JSON.parse(text)
+          } catch {}
+          resolve({ status: res.statusCode, json, text })
+        })
+      },
+    )
+    req.on("timeout", () => req.destroy(new Error("Таймаут запроса к GigaChat.")))
+    req.on("error", reject)
+    req.write(body)
+    req.end()
+  })
+}
+
+// --- Токен доступа -----------------------------------------------------------
+
+let accessToken = null
+let tokenExpiresAt = 0
+
+async function getToken() {
+  if (accessToken && Date.now() < tokenExpiresAt - 60_000) return accessToken
+
+  const authKey = process.env.GIGACHAT_AUTH_KEY
+  if (!authKey) throw new Error("GIGACHAT_AUTH_KEY не настроен в FadeHost.")
+
+  const res = await request(GIGA_AUTH_URL, {
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Basic ${authKey}`,
+      RqUID: randomUUID(),
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: `scope=${encodeURIComponent(SCOPE)}`,
+  })
+
+  if (res.status !== 200 || !res.json?.access_token) {
+    throw new Error(
+      `GigaChat auth ${res.status}: ${res.json?.message || res.text.slice(0, 150)}`,
+    )
+  }
+
+  accessToken = res.json.access_token
+  tokenExpiresAt = Number(res.json.expires_at) || Date.now() + 25 * 60_000
+  return accessToken
+}
+
+// --- Запрос к модели ---------------------------------------------------------
+
+// Склеивает подряд идущие сообщения одной роли и убирает assistant в самом начале:
+// сообщения владельца записываются как assistant, и они могут идти подряд.
+function normalize(history) {
+  const out = []
+  for (const message of history) {
+    const last = out[out.length - 1]
+    if (last && last.role === message.role) {
+      last.content += "\n" + message.content
+    } else {
+      out.push({ role: message.role, content: message.content })
+    }
+  }
+  while (out.length && out[0].role === "assistant") out.shift()
+  return out
+}
+
+// Один запрос к модели. Бросает ошибку, если ответ пустой.
+async function callModel(history, canRetryAuth = true) {
+  const token = await getToken()
+
+  const res = await request(GIGA_API_URL, {
+    headers: {
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
+      Accept: "application/json",
     },
     body: JSON.stringify({
       model: MODEL,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        ...history.slice(-MAX_HISTORY),
+        ...normalize(history.slice(-MAX_HISTORY)),
       ],
       temperature: 0.7,
       max_tokens: 200,
     }),
-    signal: AbortSignal.timeout(60000),
   })
 
-  const data = await response.json()
-
-  if (!response.ok) {
-    throw new Error(data?.error?.message || `OpenRouter HTTP ${response.status}`)
+  // Токен мог протухнуть раньше срока: получаем новый и пробуем один раз ещё.
+  if (res.status === 401 && canRetryAuth) {
+    accessToken = null
+    return callModel(history, false)
   }
 
-  const answer = data?.choices?.[0]?.message?.content
-  const answerText =
-    typeof answer === "string"
-      ? answer
-      : Array.isArray(answer)
-        ? answer.map((part) => part.text || "").join("")
-        : ""
+  if (res.status !== 200) {
+    throw new Error(res.json?.message || `GigaChat HTTP ${res.status}`)
+  }
 
-  if (!answerText.trim()) throw new Error("Модель вернула пустой ответ.")
+  const answerText = res.json?.choices?.[0]?.message?.content
+  if (typeof answerText !== "string" || !answerText.trim()) {
+    throw new Error("Модель вернула пустой ответ.")
+  }
   return answerText
 }
 
 // Общая функция запроса к ИИ: используется и в личке с ботом, и в бизнес-чатах.
-// Бесплатные модели иногда отвечают пустотой, поэтому повторяем до MAX_ATTEMPTS раз.
+// При пустом ответе повторяем до MAX_ATTEMPTS раз.
 async function askAI(key, userText) {
-  const apiKey = process.env.OPENROUTER_API_KEY
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY не настроен в FadeHost.")
-
   const history = conversations.get(key) || []
   history.push({ role: "user", content: userText })
 
@@ -90,15 +229,16 @@ async function askAI(key, userText) {
     let lastError
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const answerText = await callModel(apiKey, history)
+        const answerText = await callModel(history)
         history.push({ role: "assistant", content: answerText })
         conversations.set(key, history.slice(-MAX_HISTORY))
+        saveSoon()
         return answerText
       } catch (error) {
         lastError = error
         const isEmpty = error.message === "Модель вернула пустой ответ."
         if (!isEmpty || attempt === MAX_ATTEMPTS) break
-        console.error(`[OpenRouter] пустой ответ, попытка ${attempt} из ${MAX_ATTEMPTS}`)
+        console.error(`[GigaChat] пустой ответ, попытка ${attempt} из ${MAX_ATTEMPTS}`)
       }
     }
     throw lastError
@@ -106,8 +246,20 @@ async function askAI(key, userText) {
     history.pop()
     if (history.length) conversations.set(key, history)
     else conversations.delete(key)
+    saveSoon()
     throw error
   }
+}
+
+// Записываем в историю чата то, что владелец написал сам, чтобы бот знал весь разговор.
+function rememberOwnerMessage(key, text) {
+  const history = conversations.get(key) || []
+  const last = history[history.length - 1]
+  // Если Telegram вернул нам сообщение, которое только что отправил сам бот, дубль не нужен.
+  if (last && last.role === "assistant" && last.content === text) return
+  history.push({ role: "assistant", content: text })
+  conversations.set(key, history.slice(-MAX_HISTORY))
+  saveSoon()
 }
 
 // Telegram ограничивает длину одного сообщения.
@@ -145,6 +297,7 @@ export function registerCommands(bot) {
 
   bot.command("reset", (ctx) => {
     conversations.delete(`${ctx.chat.id}:${ctx.from.id}`)
+    saveSoon()
     return ctx.reply("Память диалога очищена. Начинаем с чистого листа!")
   })
 
@@ -164,7 +317,7 @@ export function registerCommands(bot) {
       const answer = await askAI(key, userText)
       for (const chunk of split(answer)) await ctx.reply(chunk)
     } catch (error) {
-      console.error("[OpenRouter error]", error.message)
+      console.error("[GigaChat error]", error.message)
       await ctx.reply(
         "Не удалось получить ответ от ИИ. Попробуй немного позже.\n\n" +
           `Причина: ${error.message.slice(0, 250)}`,
@@ -174,15 +327,19 @@ export function registerCommands(bot) {
 
   // Сообщения из чатов, подключённых через Secretary Mode (business).
   bot.on("business_message:text", async (ctx) => {
-    // Свои же сообщения владельца тоже приходят сюда: на них не отвечаем.
-    if (ctx.from?.id === OWNER_ID) return
-    if (ctx.from?.is_bot) return
-
     const userText = ctx.businessMessage?.text?.trim() || ctx.message?.text?.trim()
     if (!userText) return
 
-    const connectionId = ctx.businessConnectionId
     const key = `biz:${ctx.chat.id}`
+
+    // Сообщения владельца: не отвечаем на них, но запоминаем как часть разговора.
+    if (ctx.from?.id === OWNER_ID) {
+      rememberOwnerMessage(key, userText)
+      return
+    }
+    if (ctx.from?.is_bot) return
+
+    const connectionId = ctx.businessConnectionId
 
     console.log(`[business] сообщение: chat=${ctx.chat.id} from=${ctx.from?.id}`)
 
