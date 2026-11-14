@@ -56,3 +56,6 @@ the token.
 See `.env.example`.
 
 MIT licensed. Built and maintained by FadeHost.
+
+[сертификат](https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt)
+
