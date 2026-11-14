@@ -21,6 +21,15 @@ if (!token) {
 const mode = (process.env.TELEGRAM_MODE || "polling").trim().toLowerCase()
 const bot = new Bot(token)
 
+// Which kinds of updates Telegram should send. The business_* ones are
+// needed for Secretary Mode (messages from chats connected to your account).
+const ALLOWED_UPDATES = [
+  "message",
+  "callback_query",
+  "business_connection",
+  "business_message",
+]
+
 registerCommands(bot)
 
 bot.catch((err) => {
@@ -70,7 +79,10 @@ async function main() {
       })
       .listen(port, () => console.log(`[bot] webhook server listening on port ${port}`))
 
-    await bot.api.setWebhook(`${url}/telegram`, { secret_token: secret })
+    await bot.api.setWebhook(`${url}/telegram`, {
+      secret_token: secret,
+      allowed_updates: ALLOWED_UPDATES,
+    })
     console.log(`[bot] webhook set to ${url}/telegram`)
     return
   }
@@ -90,6 +102,7 @@ async function main() {
     let settled
     try {
       await bot.start({
+        allowed_updates: ALLOWED_UPDATES,
         onStart: () => {
           if (!waitingForOther) {
             console.log("[bot] polling for updates")
