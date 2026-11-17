@@ -11,6 +11,7 @@ const API_BASE_URL = (process.env.LAREPER_BASE_URL || "https://api.lareper.store
 const API_KEY = process.env.LAREPER_API_KEY
 const PRIMARY_MODEL = process.env.LAREPER_PRIMARY_MODEL || "deepseek-v4.1-flash"
 const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
+const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || ""
 
 const MAX_HISTORY = 40
 const REQUEST_TIMEOUT_MS = 60_000
@@ -132,6 +133,21 @@ const SYSTEM_PROMPT = `
 - используй только emoji из списка доступных стикеров, переданного отдельной инструкцией
 - не отправляй стикер в каждом сообщении
 - никогда не показывай служебный маркер собеседнику
+
+уведомления владельцу:
+- оценивай каждое входящее сообщение на необходимость вмешательства владельца
+- только если сообщение действительно требует внимания человека, добавь в самом конце отдельный служебный маркер:
+  [[ALERT:категория|краткая причина]]
+- категория должна быть одной из: жалоба, конфликт, срочно, важное
+- жалоба: претензия, жалоба на обслуживание или действия владельца, требование решить проблему
+- конфликт: агрессия, угроза, эскалация спора или намерение пожаловаться в органы/публично
+- срочно: явная срочная ситуация или просьба немедленно связаться с человеком
+- важное: нестандартный вопрос, решение которого нельзя безопасно поручить ИИ, просьба о личном контакте или вмешательстве
+- НЕ ставь маркер на обычные вопросы, приветствия, благодарности, шутки и бытовую переписку
+- не считай юридический вопрос автоматически важным: отмечай его только если требуется личное участие владельца
+- причина должна быть короткой, без домыслов, максимум 160 символов
+- не сообщай собеседнику, что его сообщение классифицировано или переслано владельцу
+- маркер [[ALERT:...]] никогда не показывай собеседнику
 `
 
 // --- Запрос к Lareper --------------------------------------------------------
@@ -234,6 +250,34 @@ async function callWithFallback(history) {
   }
 }
 
+// Уведомление владельцу. OWNER_TELEGRAM_ID задаётся в переменных FadeHost.
+async function sendOwnerAlert(ctx, alert, userText, isBusiness = false) {
+  if (!OWNER_TELEGRAM_ID || !alert) return
+  const sender = ctx.from
+  const name = [sender?.first_name, sender?.last_name].filter(Boolean).join(" ") || "неизвестно"
+  const username = sender?.username ? `@${sender.username}` : "нет username"
+  const category = alert.category || "важное"
+  const reason = (alert.reason || "требуется внимание владельца").slice(0, 160)
+  const message = [
+    `⚠️ Важное сообщение: ${category}`,
+    `От: ${name} (${username})`,
+    `Telegram ID: ${sender?.id ?? "неизвестно"}`,
+    `Чат ID: ${ctx.chat?.id ?? "неизвестно"}`,
+    `Тип: ${isBusiness ? "Telegram Business" : "личный чат с ботом"}`,
+    "",
+    `Причина: ${reason}`,
+    "",
+    "Сообщение:",
+    String(userText || "").slice(0, 2500),
+  ].join("\n")
+
+  try {
+    await ctx.api.sendMessage(OWNER_TELEGRAM_ID, message)
+  } catch (error) {
+    console.error("[owner alert] не удалось отправить уведомление:", error.message)
+  }
+}
+
 // Общая функция для личных и Business-чатов.
 async function askAI(key, userText) {
   const history = conversations.get(key) || []
@@ -243,14 +287,21 @@ async function askAI(key, userText) {
     const result = await callWithFallback(history)
     const marker = result.answer.match(/\[\[STICKER:([^\]]{1,16})\]\]/i)
     const stickerEmoji = marker?.[1]?.trim()
-    const answer = result.answer.replace(/\s*\[\[STICKER:[^\]]{1,16}\]\]\s*/ig, " ").trim()
+    const alertMarker = result.answer.match(/\[\[ALERT:(жалоба|конфликт|срочно|важное)\|([^\]]{1,161})\]\]/i)
+    const alert = alertMarker
+      ? { category: alertMarker[1], reason: alertMarker[2].trim() }
+      : null
+    const answer = result.answer
+      .replace(/\s*\[\[STICKER:[^\]]{1,16}\]\]\s*/ig, " ")
+      .replace(/\s*\[\[ALERT:[^\]]+\]\]\s*/ig, " ")
+      .trim()
     history.push({
       role: "assistant",
       content: answer || (stickerEmoji ? `[отправлен стикер ${stickerEmoji}]` : result.answer),
     })
     conversations.set(key, history.slice(-MAX_HISTORY))
     saveSoon()
-    return { answer, stickerEmoji }
+    return { answer, stickerEmoji, alert }
   } catch (error) {
     history.pop()
     if (history.length) conversations.set(key, history)
@@ -364,6 +415,7 @@ export function registerCommands(bot) {
         "/status — состояние настроек ИИ",
         "/reset — очистить память диалога",
         "/stickers — показать коллекцию стикеров",
+        "Важные обращения автоматически пересылаются владельцу.",
         "",
         "Просто отправь сообщение, чтобы поговорить с ИИ.",
       ].join("\n"),
@@ -395,6 +447,7 @@ export function registerCommands(bot) {
         configured ? "Lareper API-ключ: настроен" : "Lareper API-ключ: НЕ НАСТРОЕН",
         ...modelInfo().split("\n"),
         `Память диалогов: ${conversations.size} активных записей`,
+        `Уведомления владельцу: ${OWNER_TELEGRAM_ID ? "настроены" : "не настроены (задайте OWNER_TELEGRAM_ID)"}`,
       ].join("\n"),
     )
   })
@@ -420,6 +473,9 @@ export function registerCommands(bot) {
     try {
       await ctx.replyWithChatAction("typing")
       const result = await askAI(key, userText)
+      if (ctx.from?.id !== Number(OWNER_TELEGRAM_ID)) {
+        await sendOwnerAlert(ctx, result.alert, userText, false)
+      }
       await sendAIReply(ctx, result)
     } catch (error) {
       console.error("[Lareper error]", error.message)
@@ -485,6 +541,7 @@ export function registerCommands(bot) {
         .catch(() => {})
 
       const result = await askAI(key, userText)
+      await sendOwnerAlert(ctx, result.alert, userText, true)
       await sendAIReply(ctx, result, connectionId)
     } catch (error) {
       // В чужой переписке технические ошибки не отправляем.
