@@ -2,9 +2,8 @@ import { InlineKeyboard } from "grammy"
 import fs from "node:fs"
 
 // --- Lareper API -------------------------------------------------------------
-// Один API-ключ используется для обеих моделей.
-// В FadeHost задайте LAREPER_API_KEY, LAREPER_PRIMARY_MODEL и
-// LAREPER_FALLBACK_MODEL. BASE_URL можно не задавать: ниже есть значение по умолчанию.
+// В FadeHost задайте LAREPER_API_KEY, LAREPER_PRIMARY_MODEL,
+// LAREPER_FALLBACK_MODEL и OWNER_TELEGRAM_ID. BASE_URL можно не задавать.
 
 const API_BASE_URL = (process.env.LAREPER_BASE_URL || "https://api.lareper.store/v1")
   .replace(/\/+$/, "")
@@ -16,48 +15,46 @@ const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || ""
 const MAX_HISTORY = 40
 const REQUEST_TIMEOUT_MS = 60_000
 
-// --- Память диалогов ---------------------------------------------------------
-// История хранится отдельно для каждого личного или Business-чата.
+// --- Файлы -------------------------------------------------------------------
 
 const DATA_DIR = new URL("../data/", import.meta.url)
 const DATA_FILE = new URL("conversations.json", DATA_DIR)
 const DATA_TMP = new URL("conversations.json.tmp", DATA_DIR)
-
-function loadConversations() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
-    return new Map(Object.entries(raw))
-  } catch {
-    return new Map()
-  }
-}
-
-const conversations = loadConversations()
-
-// Постоянная коллекция стикеров: file_id Telegram можно отправлять повторно.
 const STICKERS_FILE = new URL("stickers.json", DATA_DIR)
 const STICKERS_TMP = new URL("stickers.json.tmp", DATA_DIR)
-function loadStickers() {
+
+function readJson(file) {
   try {
-    return new Map(Object.entries(JSON.parse(fs.readFileSync(STICKERS_FILE, "utf8"))))
+    return new Map(Object.entries(JSON.parse(fs.readFileSync(file, "utf8"))))
   } catch {
     return new Map()
   }
 }
-const stickerLibrary = loadStickers()
-let stickerSaveTimer
-function saveStickersSoon() {
-  clearTimeout(stickerSaveTimer)
-  stickerSaveTimer = setTimeout(() => {
-    try {
-      fs.mkdirSync(DATA_DIR, { recursive: true })
-      fs.writeFileSync(STICKERS_TMP, JSON.stringify(Object.fromEntries(stickerLibrary)))
-      fs.renameSync(STICKERS_TMP, STICKERS_FILE)
-    } catch (error) {
-      console.error("[stickers] не удалось сохранить коллекцию:", error.message)
-    }
-  }, 1000)
+
+function writeJsonSoon(map, tmp, file) {
+  let timer
+  return () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      try {
+        fs.mkdirSync(DATA_DIR, { recursive: true })
+        fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(map)))
+        fs.renameSync(tmp, file)
+      } catch (error) {
+        console.error(`[file] не удалось сохранить ${file.pathname}:`, error.message)
+      }
+    }, 2000)
+  }
 }
+
+const conversations = readJson(DATA_FILE)
+const saveConversationsSoon = writeJsonSoon(conversations, DATA_TMP, DATA_FILE)
+
+const stickerLibrary = readJson(STICKERS_FILE)
+const saveStickersSoon = writeJsonSoon(stickerLibrary, STICKERS_TMP, STICKERS_FILE)
+
+// --- Коллекция стикеров ------------------------------------------------------
+
 function rememberSticker(sticker) {
   const emoji = sticker.emoji || "❔"
   const items = stickerLibrary.get(emoji) || []
@@ -65,37 +62,20 @@ function rememberSticker(sticker) {
     items.unshift({
       file_id: sticker.file_id,
       file_unique_id: sticker.file_unique_id,
-      emoji,
-      set_name: sticker.set_name || null,
       is_animated: Boolean(sticker.is_animated),
       is_video: Boolean(sticker.is_video),
-      added_at: Date.now(),
     })
     stickerLibrary.set(emoji, items.slice(0, 12))
     saveStickersSoon()
   }
   return emoji
 }
+
 function availableStickerEmojis() {
   return [...stickerLibrary.keys()].filter((emoji) => emoji !== "❔").slice(0, 40)
 }
-function findSticker(emoji) {
-  return stickerLibrary.get(emoji)?.[0] || null
-}
 
-let saveTimer
-function saveSoon() {
-  clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => {
-    try {
-      fs.mkdirSync(DATA_DIR, { recursive: true })
-      fs.writeFileSync(DATA_TMP, JSON.stringify(Object.fromEntries(conversations)))
-      fs.renameSync(DATA_TMP, DATA_FILE)
-    } catch (error) {
-      console.error("[memory] не удалось сохранить историю:", error.message)
-    }
-  }, 2000)
-}
+const findSticker = (emoji) => stickerLibrary.get(emoji)?.[0] || null
 
 // --- Промт -------------------------------------------------------------------
 
@@ -156,20 +136,15 @@ function normalize(history) {
   const out = []
   for (const message of history) {
     const last = out[out.length - 1]
-    if (last && last.role === message.role) {
-      last.content += "\n" + message.content
-    } else {
-      out.push({ role: message.role, content: message.content })
-    }
+    if (last && last.role === message.role) last.content += "\n" + message.content
+    else out.push({ role: message.role, content: message.content })
   }
   while (out.length && out[0].role === "assistant") out.shift()
   return out
 }
 
 async function callModel(model, history) {
-  if (!API_KEY) {
-    throw new Error("LAREPER_API_KEY не задан в переменных окружения FadeHost.")
-  }
+  if (!API_KEY) throw new Error("LAREPER_API_KEY не задан в переменных окружения FadeHost.")
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
@@ -199,12 +174,10 @@ async function callModel(model, history) {
     })
 
     const responseText = await response.text()
-    let data
+    let data = null
     try {
       data = JSON.parse(responseText)
-    } catch {
-      data = null
-    }
+    } catch {}
 
     if (!response.ok) {
       const detail = data?.error?.message || data?.message || responseText.slice(0, 250)
@@ -212,31 +185,22 @@ async function callModel(model, history) {
     }
 
     const answer = data?.choices?.[0]?.message?.content
-    if (typeof answer !== "string" || !answer.trim()) {
-      throw new Error(`${model}: модель вернула пустой ответ.`)
-    }
-
+    if (typeof answer !== "string" || !answer.trim()) throw new Error(`${model}: модель вернула пустой ответ.`)
     return answer.trim()
   } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error(`${model}: превышено время ожидания ответа.`)
-    }
+    if (error.name === "AbortError") throw new Error(`${model}: превышено время ожидания ответа.`)
     throw error
   } finally {
     clearTimeout(timeout)
   }
 }
 
-// Сначала основная модель. При любой ошибке пробуем резервную.
 async function callWithFallback(history) {
   try {
-    const answer = await callModel(PRIMARY_MODEL, history)
-    return { answer, model: PRIMARY_MODEL }
+    return { answer: await callModel(PRIMARY_MODEL, history), model: PRIMARY_MODEL }
   } catch (primaryError) {
     console.error("[Lareper] основная модель недоступна:", primaryError.message)
-
     if (FALLBACK_MODEL === PRIMARY_MODEL) throw primaryError
-
     try {
       const answer = await callModel(FALLBACK_MODEL, history)
       console.log(`[Lareper] сработал резервный вариант: ${FALLBACK_MODEL}`)
@@ -250,22 +214,80 @@ async function callWithFallback(history) {
   }
 }
 
-// Уведомление владельцу. OWNER_TELEGRAM_ID задаётся в переменных FadeHost.
+// --- Ответ ИИ ----------------------------------------------------------------
+
+async function askAI(key, userText) {
+  const history = conversations.get(key) || []
+  history.push({ role: "user", content: userText })
+
+  try {
+    const result = await callWithFallback(history)
+    const stickerEmoji = result.answer.match(/\[\[STICKER:([^\]]{1,16})\]\]/i)?.[1]?.trim()
+    const alertMarker = result.answer.match(/\[\[ALERT:(жалоба|конфликт|срочно|важное)\|([^\]]{1,161})\]\]/i)
+    const alert = alertMarker ? { category: alertMarker[1], reason: alertMarker[2].trim() } : null
+    const answer = result.answer
+      .replace(/\s*\[\[STICKER:[^\]]{1,16}\]\]\s*/ig, " ")
+      .replace(/\s*\[\[ALERT:[^\]]+\]\]\s*/ig, " ")
+      .trim()
+    history.push({
+      role: "assistant",
+      content: answer || (stickerEmoji ? `[отправлен стикер ${stickerEmoji}]` : result.answer),
+    })
+    conversations.set(key, history.slice(-MAX_HISTORY))
+    saveConversationsSoon()
+    return { answer, stickerEmoji, alert }
+  } catch (error) {
+    history.pop()
+    if (history.length) conversations.set(key, history)
+    else conversations.delete(key)
+    saveConversationsSoon()
+    throw error
+  }
+}
+
+function rememberOwnerMessage(key, text) {
+  const history = conversations.get(key) || []
+  const last = history[history.length - 1]
+  if (last && last.role === "assistant" && last.content === text) return
+  history.push({ role: "assistant", content: text })
+  conversations.set(key, history.slice(-MAX_HISTORY))
+  saveConversationsSoon()
+}
+
+const split = (text) => text.match(/[\\s\\S]{1,4000}/g) || []
+
+async function sendAIReply(ctx, result, businessConnectionId = null) {
+  const answer = result?.answer || ""
+  for (const chunk of split(answer)) {
+    if (businessConnectionId) {
+      await ctx.api.sendMessage(ctx.chat.id, chunk, { business_connection_id: businessConnectionId })
+    } else {
+      await ctx.reply(chunk)
+    }
+  }
+
+  const sticker = result?.stickerEmoji ? findSticker(result.stickerEmoji) : null
+  if (!sticker) return
+  if (businessConnectionId) {
+    await ctx.api.sendSticker(ctx.chat.id, sticker.file_id, { business_connection_id: businessConnectionId })
+  } else {
+    await ctx.replyWithSticker(sticker.file_id)
+  }
+}
+
 async function sendOwnerAlert(ctx, alert, userText, isBusiness = false) {
   if (!OWNER_TELEGRAM_ID || !alert) return
   const sender = ctx.from
   const name = [sender?.first_name, sender?.last_name].filter(Boolean).join(" ") || "неизвестно"
   const username = sender?.username ? `@${sender.username}` : "нет username"
-  const category = alert.category || "важное"
-  const reason = (alert.reason || "требуется внимание владельца").slice(0, 160)
   const message = [
-    `⚠️ Важное сообщение: ${category}`,
+    `⚠️ Важное сообщение: ${alert.category || "важное"}`,
     `От: ${name} (${username})`,
     `Telegram ID: ${sender?.id ?? "неизвестно"}`,
     `Чат ID: ${ctx.chat?.id ?? "неизвестно"}`,
     `Тип: ${isBusiness ? "Telegram Business" : "личный чат с ботом"}`,
     "",
-    `Причина: ${reason}`,
+    `Причина: ${(alert.reason || "требуется внимание владельца").slice(0, 160)}`,
     "",
     "Сообщение:",
     String(userText || "").slice(0, 2500),
@@ -278,76 +300,35 @@ async function sendOwnerAlert(ctx, alert, userText, isBusiness = false) {
   }
 }
 
-// Общая функция для личных и Business-чатов.
-async function askAI(key, userText) {
-  const history = conversations.get(key) || []
-  history.push({ role: "user", content: userText })
+// --- Общий путь для лички и Business -----------------------------------------
+// Возвращает строку с ошибкой для показа в личке, либо null.
+// В Business ничего не показывает: там чужие люди.
 
+async function replyWithAI(ctx, { key, text, businessConnectionId, isBusiness }) {
   try {
-    const result = await callWithFallback(history)
-    const marker = result.answer.match(/\[\[STICKER:([^\]]{1,16})\]\]/i)
-    const stickerEmoji = marker?.[1]?.trim()
-    const alertMarker = result.answer.match(/\[\[ALERT:(жалоба|конфликт|срочно|важное)\|([^\]]{1,161})\]\]/i)
-    const alert = alertMarker
-      ? { category: alertMarker[1], reason: alertMarker[2].trim() }
-      : null
-    const answer = result.answer
-      .replace(/\s*\[\[STICKER:[^\]]{1,16}\]\]\s*/ig, " ")
-      .replace(/\s*\[\[ALERT:[^\]]+\]\]\s*/ig, " ")
-      .trim()
-    history.push({
-      role: "assistant",
-      content: answer || (stickerEmoji ? `[отправлен стикер ${stickerEmoji}]` : result.answer),
-    })
-    conversations.set(key, history.slice(-MAX_HISTORY))
-    saveSoon()
-    return { answer, stickerEmoji, alert }
+    if (isBusiness) {
+      await ctx.api
+        .sendChatAction(ctx.chat.id, "typing", { business_connection_id: businessConnectionId })
+        .catch(() => {})
+    } else {
+      await ctx.replyWithChatAction("typing")
+    }
+
+    const result = await askAI(key, text)
+    if (ctx.from?.id !== Number(OWNER_TELEGRAM_ID)) {
+      await sendOwnerAlert(ctx, result.alert, text, isBusiness)
+    }
+    await sendAIReply(ctx, result, businessConnectionId)
+    return null
   } catch (error) {
-    history.pop()
-    if (history.length) conversations.set(key, history)
-    else conversations.delete(key)
-    saveSoon()
-    throw error
+    const where = isBusiness ? `chat=${ctx.chat?.id} from=${ctx.from?.id}` : "private"
+    console.error(`[reply error] ${where}:`, error.stack || error.message)
+    return isBusiness ? null : `Не удалось получить ответ от ИИ. Попробуй позже.\n\nПричина: ${error.message.slice(0, 700)}`
   }
 }
 
-// Сохраняем сообщения, которые владелец сам отправил в Business-чате.
-function rememberOwnerMessage(key, text) {
-  const history = conversations.get(key) || []
-  const last = history[history.length - 1]
-  if (last && last.role === "assistant" && last.content === text) return
-
-  history.push({ role: "assistant", content: text })
-  conversations.set(key, history.slice(-MAX_HISTORY))
-  saveSoon()
-}
-
-async function sendAIReply(ctx, result, businessConnectionId = null) {
-  const answer = result?.answer || ""
-  for (const chunk of split(answer)) {
-    if (businessConnectionId) {
-      await ctx.api.sendMessage(ctx.chat.id, chunk, {
-        business_connection_id: businessConnectionId,
-      })
-    } else {
-      await ctx.reply(chunk)
-    }
-  }
-
-  const sticker = result?.stickerEmoji ? findSticker(result.stickerEmoji) : null
-  if (sticker) {
-    if (businessConnectionId) {
-      await ctx.api.sendSticker(ctx.chat.id, sticker.file_id, {
-        business_connection_id: businessConnectionId,
-      })
-    } else {
-      await ctx.replyWithSticker(sticker.file_id)
-    }
-  }
-}
-
-async function handleIncomingSticker(ctx, isBusiness = false) {
-  const message = isBusiness ? (ctx.businessMessage || ctx.message) : ctx.message
+async function replyToSticker(ctx, isBusiness) {
+  const message = isBusiness ? ctx.businessMessage : ctx.message
   const sticker = message?.sticker
   if (!sticker || !ctx.from || ctx.from.is_bot) return
 
@@ -357,34 +338,42 @@ async function handleIncomingSticker(ctx, isBusiness = false) {
     "Учти его эмоциональный оттенок и ответь естественно. Если уместно, выбери стикер из доступной коллекции."
 
   if (!isBusiness) {
-    const key = `${ctx.chat.id}:${ctx.from.id}`
-    await ctx.replyWithChatAction("typing")
-    const result = await askAI(key, description)
-    await sendAIReply(ctx, result)
+    const error = await replyWithAI(ctx, {
+      key: `${ctx.chat.id}:${ctx.from.id}`,
+      text: description,
+      isBusiness: false,
+    })
+    if (error) await ctx.reply(error).catch(() => {})
     return
   }
 
   const connectionId = ctx.businessConnectionId
-  if (!connectionId) return
-  const connection = await ctx.getBusinessConnection()
+  if (!connectionId) return ctx.empty?.() ?? undefined
+  const connection = await ctx.getBusinessConnection().catch(() => null)
   if (!connection?.is_enabled) return
 
   const key = `biz:${ctx.chat.id}`
-  if (ctx.from.id === connection.user.id) {
-    rememberOwnerMessage(key, `[владелец отправил стикер ${emoji}]`)
-    return
-  }
+  if (ctx.from.id === connection.user.id) return rememberOwnerMessage(key, `[владелец отправил стикер ${emoji}]`)
   if (!connection.rights?.can_reply) return
-
-  await ctx.api.sendChatAction(ctx.chat.id, "typing", {
-    business_connection_id: connectionId,
-  }).catch(() => {})
-
-  const result = await askAI(key, description)
-  await sendAIReply(ctx, result, connectionId)
+  await replyWithAI(ctx, { key, text: description, businessConnectionId: connectionId, isBusiness: true })
 }
 
-const split = (text) => text.match(/[\\s\\S]{1,4000}/g) || []
+async function replyToBusinessText(ctx) {
+  const userText = ctx.businessMessage?.text?.trim()
+  if (!userText || !ctx.from || ctx.from.is_bot) return
+  const connectionId = ctx.businessConnectionId
+  if (!connectionId) return
+
+  const connection = await ctx.getBusinessConnection().catch(() => null)
+  if (!connection?.is_enabled) return
+
+  const key = `biz:${ctx.chat.id}`
+  // Сообщения владельца запоминаем, но не комментируем.
+  if (ctx.from.id === connection.user.id) return rememberOwnerMessage(key, userText)
+  if (!connection.rights?.can_reply) return
+
+  await replyWithAI(ctx, { key, text: userText, businessConnectionId: connectionId, isBusiness: true })
+}
 
 function modelInfo() {
   return [
@@ -440,115 +429,46 @@ export function registerCommands(bot) {
 
   bot.command("model", (ctx) => ctx.reply(modelInfo()))
 
-  bot.command("status", (ctx) => {
-    const configured = Boolean(API_KEY)
-    return ctx.reply(
+  bot.command("status", (ctx) =>
+    ctx.reply(
       [
-        configured ? "Lareper API-ключ: настроен" : "Lareper API-ключ: НЕ НАСТРОЕН",
+        API_KEY ? "Lareper API-ключ: настроен" : "Lareper API-ключ: НЕ НАСТРОЕН",
         ...modelInfo().split("\n"),
         `Память диалогов: ${conversations.size} активных записей`,
+        `Стикеров в коллекции: ${stickerLibrary.size} emoji`,
         `Уведомления владельцу: ${OWNER_TELEGRAM_ID ? "настроены" : "не настроены (задайте OWNER_TELEGRAM_ID)"}`,
       ].join("\n"),
-    )
-  })
+    ),
+  )
 
   bot.command("reset", (ctx) => {
     conversations.delete(`${ctx.chat.id}:${ctx.from.id}`)
     conversations.delete(`biz:${ctx.chat.id}`)
-    saveSoon()
+    saveConversationsSoon()
     return ctx.reply("Память этого диалога очищена. Начинаем с чистого листа!")
   })
 
-  bot.callbackQuery("ping", async (ctx) => {
-    await ctx.answerCallbackQuery({ text: "Pong!" })
-  })
+  bot.callbackQuery("ping", (ctx) => ctx.answerCallbackQuery({ text: "Pong!" }))
 
-  // Обычные сообщения боту в личке.
+  // Личка с ботом.
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim()
     if (!userText || userText.startsWith("/")) return
-
-    const key = `${ctx.chat.id}:${ctx.from.id}`
-
-    try {
-      await ctx.replyWithChatAction("typing")
-      const result = await askAI(key, userText)
-      if (ctx.from?.id !== Number(OWNER_TELEGRAM_ID)) {
-        await sendOwnerAlert(ctx, result.alert, userText, false)
-      }
-      await sendAIReply(ctx, result)
-    } catch (error) {
-      console.error("[Lareper error]", error.message)
-      await ctx.reply(
-        "Не удалось получить ответ от ИИ. Попробуй немного позже.\n\n" +
-          `Причина: ${error.message.slice(0, 700)}`,
-      )
-    }
+    const error = await replyWithAI(ctx, {
+      key: `${ctx.chat.id}:${ctx.from.id}`,
+      text: userText,
+      isBusiness: false,
+    })
+    if (error) await ctx.reply(error).catch(() => {})
   })
 
-  bot.on("message:sticker", async (ctx) => {
-    try {
-      await handleIncomingSticker(ctx, false)
-    } catch (error) {
-      console.error("[sticker error]", error.message)
-      await ctx.reply("Стикер получил, но не смог обработать его сейчас.")
-    }
-  })
+  bot.on("message:sticker", (ctx) => replyToSticker(ctx, false))
 
-  bot.on("business_message:sticker", async (ctx) => {
-    try {
-      await handleIncomingSticker(ctx, true)
-    } catch (error) {
-      console.error("[business sticker error]", error.message)
-    }
-  })
-
-  // Telegram Business: отвечаем только при включённом соединении
-  // и наличии у него права can_reply.
-  bot.on("business_message:text", async (ctx) => {
-    const userText = ctx.businessMessage?.text?.trim() || ctx.message?.text?.trim()
-    if (!userText || !ctx.from || ctx.from.is_bot) return
-
-    const connectionId = ctx.businessConnectionId
-    if (!connectionId) {
-      console.error("[business] отсутствует business_connection_id")
-      return
-    }
-
-    try {
-      const connection = await ctx.getBusinessConnection()
-      if (!connection?.is_enabled) return
-
-      const key = `biz:${ctx.chat.id}`
-
-      // Сообщения владельца запоминаем, но не комментируем.
-      if (ctx.from.id === connection.user.id) {
-        rememberOwnerMessage(key, userText)
-        return
-      }
-
-      if (!connection.rights?.can_reply) {
-        console.log("[business] у соединения нет разрешения can_reply")
-        return
-      }
-
-      console.log(`[business] сообщение: chat=${ctx.chat.id} from=${ctx.from.id}`)
-
-      await ctx.api
-        .sendChatAction(ctx.chat.id, "typing", {
-          business_connection_id: connectionId,
-        })
-        .catch(() => {})
-
-      const result = await askAI(key, userText)
-      await sendOwnerAlert(ctx, result.alert, userText, true)
-      await sendAIReply(ctx, result, connectionId)
-    } catch (error) {
-      // В чужой переписке технические ошибки не отправляем.
-      console.error(
-        `[business chat error] chat=${ctx.chat.id} from=${ctx.from.id}:`,
-        error.message,
-      )
-    }
+  // Telegram Business. grammy 1.x отдаёт бизнес-сообщение как business_message,
+  // сабтипы при этом считаются от message: ловить нужно "business_message", а
+  // фильтр по типу внутри. Соединение и право can_reply проверяются в хендлерах.
+  bot.on("business_message", (ctx) => {
+    if (ctx.businessMessage?.text) return replyToBusinessText(ctx)
+    if (ctx.businessMessage?.sticker) return replyToSticker(ctx, true)
   })
 }
