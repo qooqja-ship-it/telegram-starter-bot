@@ -13,7 +13,10 @@ const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
 const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || ""
 
 const MAX_HISTORY = 40
-const REQUEST_TIMEOUT_MS = 60_000
+const REQUEST_TIMEOUT_MS = 90_000
+// reasoning-модели (deepseek-v4.1-flash, glm-5.2) тратят токены на размышления
+// до начала ответа; на 300 content приходил пустым.
+const MAX_TOKENS = Number(process.env.MAX_TOKENS) || 2000
 
 // --- Файлы -------------------------------------------------------------------
 
@@ -168,7 +171,10 @@ async function callModel(model, history) {
           ...normalize(history.slice(-MAX_HISTORY)),
         ],
         temperature: 0.7,
-        max_tokens: 300,
+        // reasoning-модели тратят часть бюджета на размышления, поэтому 300
+        // токенов не хватало и content приходил пустым. MAX_TOKENS можно
+        // понизить в FadeHost, если тариф считает выходные токены.
+        max_tokens: MAX_TOKENS,
       }),
       signal: controller.signal,
     })
@@ -184,9 +190,22 @@ async function callModel(model, history) {
       throw new Error(`${model}: HTTP ${response.status}: ${detail}`)
     }
 
-    const answer = data?.choices?.[0]?.message?.content
-    if (typeof answer !== "string" || !answer.trim()) throw new Error(`${model}: модель вернула пустой ответ.`)
-    return answer.trim()
+    const choice = data?.choices?.[0]
+    // Некоторые прокси отдают готовый текст в reasoning_content, а content
+    // оставляют пустым.
+    const raw = String(choice?.message?.content || choice?.message?.reasoning_content || "")
+    // Пустой текст при finish_reason "length" значит, что весь бюджет ушёл
+    // в reasoning-токены. Отдельный текст ошибки, иначе причина не видна.
+    if (!raw.trim()) {
+      if (choice?.finish_reason === "length") {
+        throw new Error(
+          `${model}: модель израсходовала все ${MAX_TOKENS} токенов на размышления и не дошла до ответа. ` +
+            "Увеличьте MAX_TOKENS или выберите модель без режима рассуждений.",
+        )
+      }
+      throw new Error(`${model}: модель вернула пустой ответ (finish_reason: ${choice?.finish_reason ?? "нет"}).`)
+    }
+    return raw.trim()
   } catch (error) {
     if (error.name === "AbortError") throw new Error(`${model}: превышено время ожидания ответа.`)
     throw error
