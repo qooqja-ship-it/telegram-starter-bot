@@ -24,8 +24,8 @@ const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
 
 const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
-const REQUEST_TIMEOUT_MS = 45_000
-const MAX_TOKENS = 180
+const REQUEST_TIMEOUT_MS = 20_000
+const MAX_TOKENS = 120
 
 // --- Промт -------------------------------------------------------------------
 // Файлы prompts/*.md читаются один раз при старте. Если их нет — берём
