@@ -22,10 +22,17 @@ const API_KEY = process.env.LAREPER_API_KEY
 const PRIMARY_MODEL = process.env.LAREPER_PRIMARY_MODEL || "deepseek-v4.1-flash"
 const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
 
+// Лимит токенов: reasoning-модели тратят заметную часть бюджета на
+// размышление. При слишком маленьком значении content остаётся пустым,
+// а reasoning_tokens съедает весь ответ.
 const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
-const REQUEST_TIMEOUT_MS = 20_000
-const MAX_TOKENS = 120
+const REQUEST_TIMEOUT_MS = 60_000
+const MAX_TOKENS = 600
+
+// Пытаемся отключить у модели пошаговое размышление. Прокси, который не
+// понимает поле, просто его проигнорирует.
+const REASONING_EFFORT = (process.env.REASONING_EFFORT || "none").trim()
 
 // --- Промт -------------------------------------------------------------------
 // Файлы prompts/*.md читаются один раз при старте. Если их нет — берём
@@ -185,6 +192,7 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
         messages: [{ role: "system", content: systemPrompt }, ...normalize(history)],
         temperature: 0.7,
         max_tokens: MAX_TOKENS,
+        reasoning_effort: REASONING_EFFORT,
       }),
       signal: controller.signal,
     })
@@ -204,14 +212,31 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
       throw apiError
     }
 
-    // Только content. reasoning_content собеседнику не показываем никогда:
-    // там внутренние рассуждения модели, а не готовый ответ.
-    const answer = data?.choices?.[0]?.message?.content
+    const choice = data?.choices?.[0]?.message
+    const answer = choice?.content
+    const usage = data?.usage
+
+    // Модель потратила токены на размышление и не успела дать ответ.
+    // Показываем это отдельной ошибкой, чтобы не путать с пустым ответом.
+    if ((!answer || !answer.trim()) && (usage?.completion_tokens_details?.reasoning_tokens || 0) > 0) {
+      throw new Error(
+        `${model}: ответ не влез в лимит — модель потратила ${usage.completion_tokens_details.reasoning_tokens} токенов на размышление из ${MAX_TOKENS}.`,
+      )
+    }
+
     if (typeof answer !== "string" || !answer.trim()) {
       throw new Error(`${model}: модель вернула пустой ответ.`)
     }
 
-    console.log(`[Lareper] ${model}: ответ за ${Date.now() - startedAt} мс`)
+    console.log(
+      `[Lareper] ${model}: ответ за ${Date.now() - startedAt} мс` +
+        (usage?.completion_tokens !== undefined
+          ? `, токенов ${usage.completion_tokens}` +
+            (usage.completion_tokens_details?.reasoning_tokens
+              ? ` (reasoning ${usage.completion_tokens_details.reasoning_tokens})`
+              : "")
+          : ""),
+    )
     return answer.trim()
   } catch (error) {
     if (error.name === "AbortError") {
