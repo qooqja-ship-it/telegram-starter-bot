@@ -21,6 +21,12 @@ const API_BASE_URL = (process.env.LAREPER_BASE_URL || "https://api.lareper.store
 const API_KEY = process.env.LAREPER_API_KEY
 const PRIMARY_MODEL = process.env.LAREPER_PRIMARY_MODEL || "deepseek-v4.1-flash"
 const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
+// Третья ступень. Если не задана — используется только две.
+const THIRD_MODEL = (process.env.LAREPER_THIRD_MODEL || "").trim()
+
+// Модели в порядке попыток. Повторы и пустые значения убираем,
+// чтобы не тратить время на запрос к той же модели дважды.
+const MODELS = [...new Set([PRIMARY_MODEL, FALLBACK_MODEL, THIRD_MODEL].filter(Boolean))]
 
 // Лимит токенов: reasoning-модели тратят заметную часть бюджета на
 // размышление. При слишком маленьком значении content остаётся пустым,
@@ -248,29 +254,29 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
   }
 }
 
-// Сначала основная модель. При ошибке доступности — резервная.
-// Ошибки ключа и запроса переключением модели не лечатся.
+// Пробуем модели по очереди: основная, резервная, третья.
+// Ошибки ключа и запроса переключением модели не лечатся — их не повторяем.
 async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
-  try {
-    const answer = await callModel(PRIMARY_MODEL, history, systemPrompt)
-    return { answer, model: PRIMARY_MODEL }
-  } catch (primaryError) {
-    console.error("[Lareper] основная модель недоступна:", primaryError.message)
+  const errors = []
 
-    if ([400, 401, 403, 404].includes(primaryError.status)) throw primaryError
-    if (FALLBACK_MODEL === PRIMARY_MODEL) throw primaryError
-
+  for (const model of MODELS) {
     try {
-      const answer = await callModel(FALLBACK_MODEL, history, systemPrompt)
-      console.log(`[Lareper] сработал резервный вариант: ${FALLBACK_MODEL}`)
-      return { answer, model: FALLBACK_MODEL }
-    } catch (fallbackError) {
-      console.error("[Lareper] резервная модель недоступна:", fallbackError.message)
-      throw new Error(
-        `Не ответили обе модели. Основная: ${primaryError.message}. Резервная: ${fallbackError.message}`,
-      )
+      const answer = await callModel(model, history, systemPrompt)
+      if (model !== MODELS[0]) {
+        console.log(`[Lareper] сработала резервная модель: ${model}`)
+      }
+      return { answer, model }
+    } catch (error) {
+      console.error(`[Lareper] ${model} недоступна:`, error.message)
+      errors.push(`${model}: ${error.message}`)
+
+      // Неверный ключ, неверный запрос, нет доступа — следующая модель
+      // даст ту же ошибку, только время потратим зря.
+      if ([400, 401, 403, 404].includes(error.status)) break
     }
   }
+
+  throw new Error(`Не ответила ни одна модель. ${errors.join(". Резервная: ")}`)
 }
 
 // Общая функция для личных и Business-чатов. Сообщение собеседника уже
@@ -353,8 +359,7 @@ async function notifyOwner(api, text, fromId, chatTitle) {
 
 function modelInfo() {
   return [
-    "Основная модель: " + PRIMARY_MODEL,
-    "Резервная модель: " + FALLBACK_MODEL,
+    ...MODELS.map((model, index) => `${["Основная", "Резервная", "Третья"][index] ?? `${index + 1}-я`} модель: ${model}`),
     "API: Lareper",
   ].join("\n")
 }
