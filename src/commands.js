@@ -140,21 +140,54 @@ function identityBlock() {
   ].join("\n")
 }
 
-// Род собеседника. Telegram его не отдаёт, поэтому в промт кладём имя
-// и требуем нейтральные формулировки, если пол не очевиден.
-function addresseeBlock(from) {
-  if (!from) return ""
+// Описание того, с кем именно идёт разговор. Без этого модель путает
+// собеседников и тащит темы из одной переписки в другую.
+function addresseeBlock(from, context = {}) {
+  const parts = []
 
-  const name = [from.first_name, from.last_name].filter(Boolean).join(" ").trim()
-  if (!name) return ""
+  const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ").trim()
+  if (name) {
+    parts.push(`собеседник: ${name}.`)
+    parts.push("род собеседника не указан. не угадывай пол по имени.")
+    parts.push("если пол не ясен из речи собеседника, пиши нейтрально: без «он», «она», «друг», «красавица»,")
+    parts.push("без обращений в мужском или женском роде.")
+  }
 
-  return [
-    `собеседник: его зовут ${name}.`,
-    "род собеседника не указан. не угадывай пол по имени.",
-    "если пол не ясен из речи собеседника, пиши нейтрально: без «он», «она», «друг», «красавица»,",
-    "без обращений в мужском или женском роде. по-русски это легко: «как дела?», «что нового?»,",
-    "«понял» замени на «понял(а)» только если не знаешь, иначе перестрой фразу.",
-  ].join(" ")
+  if (name) parts.push(`обращайся к нему по имени, если это уместно: ${name.split(" ")[0]}.`)
+
+  const username = from?.username ? `@${from.username}` : null
+  if (username) parts.push(`его username: ${username}.`)
+
+  parts.push(...isolationBlock(context))
+
+  return parts.join(" ")
+}
+
+// Ключевое правило: каждая переписка независима. Без явного запрета
+// модель переносит факты и тон из одного чата в другой.
+function isolationBlock({ chatLabel, chatKind } = {}) {
+  const lines = [
+    "важно: это отдельная переписка с конкретным человеком.",
+    "историю выше — только из этого чата. других собеседников ты сейчас не видишь.",
+  ]
+
+  if (chatKind === "business") {
+    lines.push(
+      "это личная переписка владельца с этим человеком. говори с ним как владелец, по делу этого разговора.",
+    )
+  } else {
+    lines.push("этот человек пишет напрямую тебе, а не в личную переписку владельца.")
+  }
+
+  if (chatLabel) lines.push(`как помечен этот чат: ${chatLabel}.`)
+
+  lines.push(
+    "не смешивай: не упоминай темы, имена и договорённости из других переписок.",
+    "если собеседник спрашивает о чём-то, чего нет в этом разговоре, — не знаешь и уточнишь позже.",
+    "тон подбирай под этого человека: тёплый разговор — тёплый, рабочий — рабочий.",
+  )
+
+  return lines
 }
 
 // Порядок важен: правила идут до стиля, а стиль последним.
@@ -170,10 +203,10 @@ const SYSTEM_PROMPT = [
   "напоминание: самое важное — манера письма. пиши как живой человек, как описано выше.",
 ].join("\n\n")
 
-function systemPromptFor(from) {
+function systemPromptFor(from, context = {}) {
   const parts = [SYSTEM_PROMPT]
 
-  const addressee = addresseeBlock(from)
+  const addressee = addresseeBlock(from, context)
   if (addressee) parts.push(addressee)
 
   const now = nowBlock()
@@ -432,12 +465,16 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
 // записано в базу до вызова — здесь только контекст и ответ.
 // send — функция отправки/редактирования, чтобы текст появлялся по мере
 // генерации. Без неё просто ждём готовый ответ.
-async function askAI(chatKey, userText, chatType = "private", from = null, hooks = {}) {
+async function askAI(chatKey, userText, chatType = "private", from = null, hooks = {}, context = {}) {
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
   try {
-    const result = await callWithFallback(history, systemPromptFor(from), hooks)
+    const result = await callWithFallback(
+      history,
+      systemPromptFor(from, { ...context, chatKind: chatType }),
+      hooks,
+    )
     addMessage(chatKey, "assistant", result.answer, chatType)
     return result.answer
   } catch (error) {
