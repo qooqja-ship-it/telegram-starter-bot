@@ -387,17 +387,25 @@ function looksImportant(text) {
   return ALERT_WORDS.some((word) => lower.includes(word))
 }
 
-async function notifyOwner(api, text, fromId, chatTitle) {
+async function notifyOwner(api, text, from, chatLabel) {
   if (!OWNER_TELEGRAM_ID) return
+
+  const fromId = from?.id
+  if (!fromId) return
 
   const since = lastAlertAt.get(fromId) || 0
   if (Date.now() - since < ALERT_COOLDOWN_MS) return
   lastAlertAt.set(fromId, Date.now())
 
+  const fullName = [from.first_name, from.last_name].filter(Boolean).join(" ").trim()
+  const username = from.username ? `@${from.username}` : null
+
   const lines = [
     "важное сообщение",
-    chatTitle ? `чат: ${chatTitle}` : null,
-    `от: ${fromId}`,
+    chatLabel ? `чат: ${chatLabel}` : null,
+    fullName ? `от: ${fullName}` : null,
+    username,
+    `ID: ${fromId}`,
     "",
     text.length > 900 ? text.slice(0, 900) + "…" : text,
   ].filter(Boolean)
@@ -406,6 +414,24 @@ async function notifyOwner(api, text, fromId, chatTitle) {
     await api.sendMessage(OWNER_TELEGRAM_ID, lines.join("\n"))
   } catch (error) {
     console.error("[alert] не удалось отправить уведомление:", error.message)
+    return
+  }
+
+  // Контакт-карточка: по ней в Telegram открывается профиль собеседника
+  // и чат с ним. По одному ID открыть профиль нельзя.
+  try {
+    if (username) {
+      await api.sendContact(OWNER_TELEGRAM_ID, fromId, from.first_name || "", {
+        last_name: from.last_name,
+        vcard: username,
+      })
+    } else {
+      await api.sendContact(OWNER_TELEGRAM_ID, fromId, from.first_name || "", {
+        last_name: from.last_name,
+      })
+    }
+  } catch (error) {
+    console.error("[alert] не удалось отправить контакт:", error.message)
   }
 }
 
@@ -530,7 +556,7 @@ export function registerCommands(bot) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        await notifyOwner(ctx.api, userText, ctx.from.id, `личка · ${senderName || ctx.from.id}`)
+        await notifyOwner(ctx.api, userText, ctx.from, `личка · ${senderName || ctx.from.id}`)
       }
 
       await ctx.replyWithChatAction("typing")
@@ -599,7 +625,7 @@ export function registerCommands(bot) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        await notifyOwner(ctx.api, userText, ctx.from.id, senderName || `chat ${ctx.chat.id}`)
+        await notifyOwner(ctx.api, userText, ctx.from, senderName || `chat ${ctx.chat.id}`)
       }
 
       await ctx.api
