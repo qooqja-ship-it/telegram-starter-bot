@@ -35,9 +35,14 @@ const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
 
 // Сколько ждать одну модель и сколько — все попытки вместе.
-// Поднимать первое выше смысла нет, если прокси лежит: человек ждёт зря.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 45_000
+// Бюджет должен вмещать хотя бы по одной попытке на каждую модель,
+// иначе резервные так и не получат шанса.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 25_000
 const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 90_000
+
+// Повтор той же модели имеет смысл, только если на него остаётся время
+// и ещё остаётся чем ответить, если повтор тоже не пройдёт.
+const MIN_TIME_AFTER_RETRY_MS = 25_000
 const MAX_TOKENS = 600
 
 // Пытаемся отключить у модели пошаговое размышление. Прокси, который не
@@ -265,8 +270,13 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT, hooks = {
     throw new Error("LAREPER_API_KEY не задан в переменных окружения FadeHost.")
   }
 
+  // Таймаут не длиннее остатка общего бюджета: иначе последняя модель
+  // может висеть дольше, чем собеседник готов ждать.
+  const budgetLeft = Number(hooks.budgetLeft) || REQUEST_TIMEOUT_MS
+  const timeoutMs = Math.max(5_000, Math.min(REQUEST_TIMEOUT_MS, budgetLeft))
+
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   const startedAt = Date.now()
   let firstTokenAt = 0
 
@@ -342,8 +352,17 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
       },
       onDelta: hooks.onDelta,
     }
-
     for (;;) {
+      // Перед каждой попыткой считаем остаток бюджета и не даём модели
+      // висеть дольше, чем осталось.
+      const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt)
+      if (remaining < 5_000) {
+        errors.push(`${model}: не хватило общего времени (${TOTAL_BUDGET_MS} мс)`)
+        return fail()
+      }
+
+      modelHooks.budgetLeft = remaining
+
       try {
         const answer = await callModel(model, history, systemPrompt, modelHooks)
         if (model !== MODELS[0]) {
@@ -352,7 +371,18 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
         return { answer, model }
       } catch (error) {
         const isTimeout = /время ожидания/.test(error.message)
-        const canRetry = isTimeout && !retried && Date.now() - startedAt < TOTAL_BUDGET_MS
+        const elapsed = Date.now() - startedAt
+        const remaining = TOTAL_BUDGET_MS - elapsed
+        const modelsLeft = MODELS.length - MODELS.indexOf(model) - 1
+
+        // Повтор разрешаем, только если после него останется время
+        // хотя бы на одну резервную модель. Иначе повтор съест весь
+        // бюджет, как это уже случалось с 45-секундным таймаутом.
+        const canRetry =
+          isTimeout &&
+          !retried &&
+          remaining > MIN_TIME_AFTER_RETRY_MS &&
+          (modelsLeft === 0 || remaining > REQUEST_TIMEOUT_MS + MIN_TIME_AFTER_RETRY_MS)
 
         console.error(
           `[Lareper] ${model} недоступна${canRetry ? " (повтор)" : ""}:`,
