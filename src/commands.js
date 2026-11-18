@@ -134,14 +134,17 @@ function addresseeBlock(from) {
   ].join(" ")
 }
 
+// Порядок важен: правила идут до стиля, а стиль последним.
+// Модель сильнее придерживается того, что стоит в конце промта.
 const SYSTEM_PROMPT = [
   IMPERSONATE
     ? `ты ${OWNER_NAME}, ведёшь свою личную переписку в Telegram.`
     : "ты ИИ-помощник, который помогает владельцу аккаунта вести переписку.",
   `известные сведения о владельце: ${ABOUT_ME}`,
   identityBlock(),
-  STYLE_PROMPT || FALLBACK_PROMPT.split("общение:")[0],
   RULES_PROMPT || `общение:${FALLBACK_PROMPT.split("общение:")[1]}`,
+  STYLE_PROMPT || FALLBACK_PROMPT.split("общение:")[0],
+  "напоминание: самое важное — манера письма. пиши как живой человек, как описано выше.",
 ].join("\n\n")
 
 function systemPromptFor(from) {
@@ -387,7 +390,7 @@ function looksImportant(text) {
   return ALERT_WORDS.some((word) => lower.includes(word))
 }
 
-async function notifyOwner(api, text, from, chatLabel) {
+async function notifyOwner(api, text, from, chatLabel, originalMessage = null) {
   if (!OWNER_TELEGRAM_ID) return
 
   const fromId = from?.id
@@ -405,7 +408,6 @@ async function notifyOwner(api, text, from, chatLabel) {
     chatLabel ? `чат: ${chatLabel}` : null,
     fullName ? `от: ${fullName}` : null,
     username,
-    `ID: ${fromId}`,
     "",
     text.length > 900 ? text.slice(0, 900) + "…" : text,
   ].filter(Boolean)
@@ -417,21 +419,20 @@ async function notifyOwner(api, text, from, chatLabel) {
     return
   }
 
-  // Контакт-карточка: по ней в Telegram открывается профиль собеседника
-  // и чат с ним. По одному ID открыть профиль нельзя.
-  try {
-    if (username) {
-      await api.sendContact(OWNER_TELEGRAM_ID, fromId, from.first_name || "", {
-        last_name: from.last_name,
-        vcard: username,
-      })
-    } else {
-      await api.sendContact(OWNER_TELEGRAM_ID, fromId, from.first_name || "", {
-        last_name: from.last_name,
-      })
+  // Пересылаем исходное сообщение: в нём видно имя отправителя,
+  // и по нему открывается профиль. Если Telegram не разрешит переслать,
+  // пробуем копию — она содержит тот же текст, но без ссылки на автора.
+  if (originalMessage) {
+    try {
+      await api.forwardMessage(OWNER_TELEGRAM_ID, originalMessage.chat.id, originalMessage.message_id)
+    } catch (error) {
+      console.error("[alert] пересылка не удалась, пробую копию:", error.message)
+      try {
+        await api.copyMessage(OWNER_TELEGRAM_ID, originalMessage.chat.id, originalMessage.message_id)
+      } catch (copyError) {
+        console.error("[alert] копирование тоже не удалось:", copyError.message)
+      }
     }
-  } catch (error) {
-    console.error("[alert] не удалось отправить контакт:", error.message)
   }
 }
 
@@ -556,7 +557,7 @@ export function registerCommands(bot) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        await notifyOwner(ctx.api, userText, ctx.from, `личка · ${senderName || ctx.from.id}`)
+        await notifyOwner(ctx.api, userText, ctx.from, `личка · ${senderName || ctx.from.id}`, ctx.message)
       }
 
       await ctx.replyWithChatAction("typing")
@@ -625,7 +626,13 @@ export function registerCommands(bot) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        await notifyOwner(ctx.api, userText, ctx.from, senderName || `chat ${ctx.chat.id}`)
+        await notifyOwner(
+          ctx.api,
+          userText,
+          ctx.from,
+          senderName || `chat ${ctx.chat.id}`,
+          ctx.businessMessage ?? null,
+        )
       }
 
       await ctx.api
