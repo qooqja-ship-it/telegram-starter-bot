@@ -246,5 +246,28 @@ export function migrateLegacyFile(legacyPath) {
   return { migrated: true, chats: chatsTouched, messages: inserted, ...stats() }
 }
 
+// Автоматическая миграция при старте: если старая история ещё не перенесена
+// и файл найден — переносим. Ошибку глушим, чтобы бот поднялся в любом случае.
+export function autoMigrate() {
+  const candidates = [
+    process.env.LEGACY_JSON?.trim(),
+    path.join(process.cwd(), "data", "conversations.json"),
+    "/data/conversations.json",
+  ].filter(Boolean)
+
+  const legacyPath = candidates.find((candidate) => fs.existsSync(candidate))
+  if (!legacyPath) {
+    console.log("[SQLite] старая история conversations.json не найдена, миграция не нужна")
+    return { skipped: true }
+  }
+
+  try {
+    return migrateLegacyFile(legacyPath)
+  } catch (error) {
+    console.error("[SQLite] миграция не удалась:", error.message)
+    return { failed: true, error: error.message }
+  }
+}
+
 console.log("[SQLite] База данных открыта:", DB_PATH)
 export { LEGACY_FLAG }

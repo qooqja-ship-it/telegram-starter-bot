@@ -11,6 +11,7 @@
 import http from "node:http"
 import { Bot, webhookCallback } from "grammy"
 import { registerCommands } from "./src/commands.js"
+import { DB_PATH, autoMigrate, stats } from "./src/db.js"
 
 const token = process.env.TELEGRAM_BOT_TOKEN
 if (!token) {
@@ -29,6 +30,11 @@ const ALLOWED_UPDATES = [
   "business_connection",
   "business_message",
 ]
+
+// Переносит старую историю conversations.json в SQLite. Повторно не срабатывает.
+autoMigrate()
+const dbStats = stats()
+console.log(`[SQLite] файл ${DB_PATH}, чатов ${dbStats.chats}, сообщений ${dbStats.messages}`)
 
 registerCommands(bot)
 
