@@ -1,11 +1,11 @@
 import { InlineKeyboard } from "grammy"
 import fs from "node:fs"
 import path from "node:path"
+import { streamModel } from "./ai.js"
 import {
   DATA_DIR,
   addMessage,
   deleteChat,
-  lastMessage,
   messageCount,
   recentMessages,
   stats,
@@ -258,7 +258,9 @@ function normalize(history) {
   return out
 }
 
-async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
+// Потоковый запрос: onDelta вызывается по мере поступления текста,
+// onFirstToken — когда пришёл первый символ.
+async function callModel(model, history, systemPrompt = SYSTEM_PROMPT, hooks = {}) {
   if (!API_KEY) {
     throw new Error("LAREPER_API_KEY не задан в переменных окружения FadeHost.")
   }
@@ -266,73 +268,39 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
   const startedAt = Date.now()
+  let firstTokenAt = 0
 
   try {
-    const response = await fetch(`${API_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        model,
+    const answer = await streamModel({
+      baseUrl: API_BASE_URL,
+      apiKey: API_KEY,
+      model,
+      body: {
         messages: [{ role: "system", content: systemPrompt }, ...normalize(history)],
         temperature: 0.7,
         max_tokens: MAX_TOKENS,
-        reasoning_effort: REASONING_EFFORT,
-      }),
+      },
+      reasoningEffort: REASONING_EFFORT,
       signal: controller.signal,
+      onDelta: async (chunk, full) => {
+        if (!firstTokenAt) {
+          firstTokenAt = Date.now()
+          await hooks.onFirstToken?.(Date.now() - startedAt)
+        }
+        await hooks.onDelta?.(chunk, full)
+      },
     })
 
-    const responseText = await response.text()
-    let data
-    try {
-      data = JSON.parse(responseText)
-    } catch {
-      data = null
-    }
-
-    if (!response.ok) {
-      const detail = data?.error?.message || data?.message || responseText.slice(0, 250)
-      const apiError = new Error(`${model}: HTTP ${response.status}: ${detail}`)
-      apiError.status = response.status
-      throw apiError
-    }
-
-    const choice = data?.choices?.[0]?.message
-    const answer = choice?.content
-    const usage = data?.usage
-
-    // Модель потратила токены на размышление и не успела дать ответ.
-    // Показываем это отдельной ошибкой, чтобы не путать с пустым ответом.
-    if ((!answer || !answer.trim()) && (usage?.completion_tokens_details?.reasoning_tokens || 0) > 0) {
-      throw new Error(
-        `${model}: ответ не влез в лимит — модель потратила ${usage.completion_tokens_details.reasoning_tokens} токенов на размышление из ${MAX_TOKENS}.`,
-      )
-    }
-
-    if (typeof answer !== "string" || !answer.trim()) {
+    if (!answer) {
       throw new Error(`${model}: модель вернула пустой ответ.`)
-    }
-
-    // Обрыв на середине: модель упёрлась в лимит токенов. Такое лучше
-    // не отправлять собеседнику, чем отправить «Махачкала я».
-    const finishReason = data?.choices?.[0]?.finish_reason
-    if (finishReason === "length") {
-      console.error(`[Lareper] ${model}: ответ обрезан по лимиту токенов (${MAX_TOKENS})`)
     }
 
     console.log(
       `[Lareper] ${model}: ответ за ${Date.now() - startedAt} мс` +
-        (usage?.completion_tokens !== undefined
-          ? `, токенов ${usage.completion_tokens}` +
-            (usage.completion_tokens_details?.reasoning_tokens
-              ? ` (reasoning ${usage.completion_tokens_details.reasoning_tokens})`
-              : "")
-          : ""),
+        (firstTokenAt ? `, первый токен за ${firstTokenAt - startedAt} мс` : "") +
+        `, символов ${answer.length}`,
     )
-    return answer.trim()
+    return answer
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(`${model}: превышено время ожидания ответа.`)
@@ -345,7 +313,7 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
 
 // Пробуем модели по очереди: основная, резервная, третья.
 // Ошибки ключа и запроса переключением модели не лечатся — их не повторяем.
-async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
+async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {}) {
   const errors = []
   const startedAt = Date.now()
   const fail = () => {
@@ -363,10 +331,21 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
     // Одна попытка и, если был таймаут, ещё одна: прокси иногда отвечает
     // со второго раза.
     let retried = false
+    let started = false
+
+    // Если модель начала отвечать и упала на середине, черновик уже
+    // показан собеседнику. Перед следующей моделью его надо сбросить.
+    const modelHooks = {
+      onFirstToken: async (ms) => {
+        started = true
+        await hooks.onFirstToken?.(ms)
+      },
+      onDelta: hooks.onDelta,
+    }
 
     for (;;) {
       try {
-        const answer = await callModel(model, history, systemPrompt)
+        const answer = await callModel(model, history, systemPrompt, modelHooks)
         if (model !== MODELS[0]) {
           console.log(`[Lareper] сработала резервная модель: ${model}`)
         }
@@ -379,6 +358,9 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
           `[Lareper] ${model} недоступна${canRetry ? " (повтор)" : ""}:`,
           error.message,
         )
+
+        if (started) await hooks.onReset?.()
+        started = false
 
         if (canRetry) {
           retried = true
@@ -401,17 +383,78 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
 
 // Общая функция для личных и Business-чатов. Сообщение собеседника уже
 // записано в базу до вызова — здесь только контекст и ответ.
-async function askAI(chatKey, userText, chatType = "private", from = null) {
+// send — функция отправки/редактирования, чтобы текст появлялся по мере
+// генерации. Без неё просто ждём готовый ответ.
+async function askAI(chatKey, userText, chatType = "private", from = null, hooks = {}) {
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
   try {
-    const result = await callWithFallback(history, systemPromptFor(from))
+    const result = await callWithFallback(history, systemPromptFor(from), hooks)
     addMessage(chatKey, "assistant", result.answer, chatType)
     return result.answer
   } catch (error) {
-    // Сообщение собеседника остаётся в истории: он его действительно написал.
     throw error
+  }
+}
+
+// --- Живой набор в Telegram --------------------------------------------------
+// Ответ модели приходит кусками. Показываем его одним сообщением, которое
+// правим по мере поступления текста. Так собеседник видит ответ через
+// секунду, а не через тридцать.
+
+const DRAFT_UPDATE_MS = 900
+
+function createDraft({ send, edit }) {
+  let messageId = null
+  let lastSent = ""
+  let lastAt = 0
+  let pending = null
+
+  async function flush(full, force = false) {
+    if (!full) return
+    const now = Date.now()
+    if (!force && now - lastAt < DRAFT_UPDATE_MS) return
+    if (full === lastSent) return
+
+    lastAt = now
+    lastSent = full
+
+    try {
+      if (messageId === null) {
+        messageId = await send(full)
+      } else {
+        await edit(messageId, full)
+      }
+    } catch (error) {
+      // Правка может не пройти, если текст не изменился или Telegram
+      // ругается на частоту. Это не повод ломать ответ.
+      if (!/message is not modified/i.test(error.message)) {
+        console.error("[draft] не удалось обновить сообщение:", error.message)
+      }
+    }
+  }
+
+  return {
+    onFirstToken: () => {},
+    onDelta: async (_chunk, full) => {
+      pending = full
+      await flush(full)
+    },
+    // Модель упала после начала ответа: убираем черновик, чтобы
+    // собеседник не видел обрывок.
+    onReset: async () => {
+      if (messageId !== null && lastSent) {
+        await edit(messageId, "…").catch(() => {})
+      }
+      messageId = null
+      lastSent = ""
+      pending = null
+    },
+    async finish(full) {
+      await flush(full, true)
+      return messageId
+    },
   }
 }
 
@@ -508,7 +551,6 @@ function modelInfo() {
   ].join("\n")
 }
 
-const split = (text) => text.match(/[\s\S]{1,4000}/g) || []
 
 const STICKERS_FILE = path.join(DATA_DIR, "stickers.json")
 
@@ -626,8 +668,17 @@ export function registerCommands(bot) {
       }
 
       await ctx.replyWithChatAction("typing")
-      const answer = await askAI(chatKey, userText, "private", ctx.from)
-      for (const chunk of split(answer)) await ctx.reply(chunk)
+
+      const draft = createDraft({
+        send: async (text) => {
+          const sent = await ctx.reply(text)
+          return sent.message_id
+        },
+        edit: (id, text) => ctx.api.editMessageText(ctx.chat.id, id, text),
+      })
+
+      const answer = await askAI(chatKey, userText, "private", ctx.from, draft)
+      await draft.finish(answer)
     } catch (error) {
       console.error("[Lareper error]", error.message)
       await ctx.reply(
@@ -704,12 +755,21 @@ export function registerCommands(bot) {
         .sendChatAction(ctx.chat.id, "typing", { business_connection_id: connectionId })
         .catch(() => {})
 
-      const answer = await askAI(chatKey, userText, "business", ctx.from)
-      for (const chunk of split(answer)) {
-        await ctx.api.sendMessage(ctx.chat.id, chunk, {
-          business_connection_id: connectionId,
-        })
-      }
+      const draft = createDraft({
+        send: async (text) => {
+          const sent = await ctx.api.sendMessage(ctx.chat.id, text, {
+            business_connection_id: connectionId,
+          })
+          return sent.message_id
+        },
+        edit: (id, text) =>
+          ctx.api.editMessageText(ctx.chat.id, id, text, {
+            business_connection_id: connectionId,
+          }),
+      })
+
+      const answer = await askAI(chatKey, userText, "business", ctx.from, draft)
+      await draft.finish(answer)
     } catch (error) {
       // В чужой переписке технические ошибки не отправляем.
       console.error(
