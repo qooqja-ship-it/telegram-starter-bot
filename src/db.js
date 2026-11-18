@@ -29,7 +29,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
     sender_type TEXT NOT NULL
-      CHECK(sender_type IN ('user', 'owner', 'assistant')),
+      CHECK(sender_type IN ('user', 'owner', 'assistant', 'legacy_assistant')),
     message_type TEXT NOT NULL DEFAULT 'text',
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
