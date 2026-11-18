@@ -20,7 +20,7 @@ const API_BASE_URL = (process.env.LAREPER_BASE_URL || "https://api.lareper.store
   .replace(/\/+$/, "")
 const API_KEY = process.env.LAREPER_API_KEY
 const PRIMARY_MODEL = process.env.LAREPER_PRIMARY_MODEL || "deepseek-v4.1-flash"
-const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2"
+const FALLBACK_MODEL = process.env.LAREPER_FALLBACK_MODEL || "glm-5.2-fast-preview"
 // Третья ступень. Если не задана — используется только две.
 const THIRD_MODEL = (process.env.LAREPER_THIRD_MODEL || "").trim()
 
@@ -33,11 +33,12 @@ const MODELS = [...new Set([PRIMARY_MODEL, FALLBACK_MODEL, THIRD_MODEL].filter(B
 // а reasoning_tokens съедает весь ответ.
 const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
-const REQUEST_TIMEOUT_MS = 25_000
-const MAX_TOKENS = 600
 
-// Сколько всего времени можно потратить на перебор моделей.
-const TOTAL_BUDGET_MS = 70_000
+// Сколько ждать одну модель и сколько — все попытки вместе.
+// Поднимать первое выше смысла нет, если прокси лежит: человек ждёт зря.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 45_000
+const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 90_000
+const MAX_TOKENS = 600
 
 // Пытаемся отключить у модели пошаговое размышление. Прокси, который не
 // понимает поле, просто его проигнорирует.
@@ -161,22 +162,67 @@ function systemPromptFor(from) {
 
 // Текущее время в Махачкале. Без этого бот говорит «я на работе»
 // и в субботу в полночь.
+// Текущее время в Махачкале и вывод, где владелец находится сейчас.
+// Считаем в коде, а не просим посчитать модель: на этом она уже ошибалась,
+// отвечая «сегодня выходной» в среду днём.
 function nowBlock() {
   const now = new Date()
 
-  const time = new Intl.DateTimeFormat("ru-RU", {
+  const fmt = new Intl.DateTimeFormat("ru-RU", {
     timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    weekday: "long",
-    day: "numeric",
-    month: "long",
-  }).format(now)
+    hour12: false,
+  })
+
+  const parts = Object.fromEntries(
+    fmt.formatToParts(now).map((part) => [part.type, part.value]),
+  )
+
+  const year = Number(parts.year)
+  const month = Number(parts.month)
+  const day = Number(parts.day)
+  const hour = Number(parts.hour)
+  const minute = Number(parts.minute)
+
+  // 0 — воскресенье, 1 — понедельник.
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+  const weekdayName = [
+    "воскресенье",
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+  ][weekday]
+
+  const minutes = hour * 60 + minute
+  const isWeekend = weekday === 0 || weekday === 6
+
+  // Пятница до 16:45, остальные будни до 18:00.
+  const endMinutes = weekday === 5 ? 16 * 60 + 45 : 18 * 60
+  const atWork = !isWeekend && minutes >= 9 * 60 && minutes < endMinutes
+
+  let situation
+  if (isWeekend) {
+    situation = "сегодня выходной, ты дома и не на работе"
+  } else if (atWork) {
+    situation = "сейчас рабочее время, ты на работе в Верховном суде"
+  } else if (minutes < 9 * 60) {
+    situation = "рабочий день ещё не начался, ты дома"
+  } else {
+    situation = "рабочий день уже закончился, ты дома"
+  }
 
   return [
-    `сейчас ${time} (Махачкала, московское время).`,
-    "учитывай это: в рабочие часы будни ты можешь быть на работе, вечером, ночью и в выходные — дома.",
-    "время не называй, если не спрашивают.",
+    `сейчас ${weekdayName}, ${parts.day}.${parts.month}.${parts.year}, ${parts.hour}:${parts.minute} по Махачкале.`,
+    `факт: ${situation}.`,
+    "это верно и не подлежит сомнению. отвечай о своём местоположении только исходя из этого факта.",
+    "время и день недели называй, только если спрашивают.",
   ].join(" ")
 }
 
@@ -302,36 +348,55 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
 async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
   const errors = []
   const startedAt = Date.now()
+  const fail = () => {
+    throw new Error(`Не ответила ни одна модель. ${errors.join(" Резервная: ")}`)
+  }
 
   for (const model of MODELS) {
     // Общий бюджет на все попытки. Если модели уже молчат дольше, чем
     // собеседник готов ждать, дальше перебирать нет смысла.
     if (Date.now() - startedAt > TOTAL_BUDGET_MS) {
       errors.push(`дальше не пробовал: истёк общий лимит ${TOTAL_BUDGET_MS} мс`)
-      break
+      return fail()
     }
 
-    try {
-      const answer = await callModel(model, history, systemPrompt)
-      if (model !== MODELS[0]) {
-        console.log(`[Lareper] сработала резервная модель: ${model}`)
+    // Одна попытка и, если был таймаут, ещё одна: прокси иногда отвечает
+    // со второго раза.
+    let retried = false
+
+    for (;;) {
+      try {
+        const answer = await callModel(model, history, systemPrompt)
+        if (model !== MODELS[0]) {
+          console.log(`[Lareper] сработала резервная модель: ${model}`)
+        }
+        return { answer, model }
+      } catch (error) {
+        const isTimeout = /время ожидания/.test(error.message)
+        const canRetry = isTimeout && !retried && Date.now() - startedAt < TOTAL_BUDGET_MS
+
+        console.error(
+          `[Lareper] ${model} недоступна${canRetry ? " (повтор)" : ""}:`,
+          error.message,
+        )
+
+        if (canRetry) {
+          retried = true
+          continue
+        }
+
+        errors.push(`${model}: ${error.message}`)
+
+        // Неверный ключ, запрос или квота: следующая модель того же прокси
+        // даст ту же ошибку, только время потратим зря.
+        if ([400, 401, 402, 403, 404, 429].includes(error.status)) return fail()
+
+        break
       }
-      return { answer, model }
-    } catch (error) {
-      console.error(`[Lareper] ${model} недоступна:`, error.message)
-      errors.push(`${model}: ${error.message}`)
-
-      // Неверный ключ, неверный запрос, нет доступа — следующая модель
-      // даст ту же ошибку, только время потратим зря.
-      if ([400, 401, 403, 404].includes(error.status)) break
-
-      // Прокси ответил, что модели нет или кончилась квота: перебор
-      // остальных моделей того же прокси не поможет.
-      if ([402, 429].includes(error.status)) break
     }
   }
 
-  throw new Error(`Не ответила ни одна модель. ${errors.join(" Резервная: ")}`)
+  return fail()
 }
 
 // Общая функция для личных и Business-чатов. Сообщение собеседника уже
