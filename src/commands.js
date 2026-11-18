@@ -56,7 +56,9 @@ function readPromptFile(name) {
 }
 
 const ABOUT_ME =
-  process.env.ABOUT_ME || "меня зовут Магомед, я юрист. других фактов о себе у тебя нет."
+  process.env.ABOUT_ME ||
+  readPromptFile("about_owner.md") ||
+  "меня зовут Магомед, я юрист. других фактов о себе у тебя нет."
 
 const STYLE_PROMPT = readPromptFile("communication_style.md")
 const RULES_PROMPT = readPromptFile("behavior_rules.md")
@@ -143,8 +145,36 @@ const SYSTEM_PROMPT = [
 ].join("\n\n")
 
 function systemPromptFor(from) {
+  const parts = [SYSTEM_PROMPT]
+
   const addressee = addresseeBlock(from)
-  return addressee ? `${SYSTEM_PROMPT}\n\n${addressee}` : SYSTEM_PROMPT
+  if (addressee) parts.push(addressee)
+
+  const now = nowBlock()
+  if (now) parts.push(now)
+
+  return parts.join("\n\n")
+}
+
+// Текущее время в Махачкале. Без этого бот говорит «я на работе»
+// и в субботу в полночь.
+function nowBlock() {
+  const now = new Date()
+
+  const time = new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+  }).format(now)
+
+  return [
+    `сейчас ${time} (Махачкала, московское время).`,
+    "учитывай это: в рабочие часы будни ты можешь быть на работе, вечером, ночью и в выходные — дома.",
+    "время не называй, если не спрашивают.",
+  ].join(" ")
 }
 
 
