@@ -33,8 +33,11 @@ const MODELS = [...new Set([PRIMARY_MODEL, FALLBACK_MODEL, THIRD_MODEL].filter(B
 // а reasoning_tokens съедает весь ответ.
 const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
-const REQUEST_TIMEOUT_MS = 60_000
+const REQUEST_TIMEOUT_MS = 25_000
 const MAX_TOKENS = 600
+
+// Сколько всего времени можно потратить на перебор моделей.
+const TOTAL_BUDGET_MS = 70_000
 
 // Пытаемся отключить у модели пошаговое размышление. Прокси, который не
 // понимает поле, просто его проигнорирует.
@@ -234,6 +237,13 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
       throw new Error(`${model}: модель вернула пустой ответ.`)
     }
 
+    // Обрыв на середине: модель упёрлась в лимит токенов. Такое лучше
+    // не отправлять собеседнику, чем отправить «Махачкала я».
+    const finishReason = data?.choices?.[0]?.finish_reason
+    if (finishReason === "length") {
+      console.error(`[Lareper] ${model}: ответ обрезан по лимиту токенов (${MAX_TOKENS})`)
+    }
+
     console.log(
       `[Lareper] ${model}: ответ за ${Date.now() - startedAt} мс` +
         (usage?.completion_tokens !== undefined
@@ -258,8 +268,16 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT) {
 // Ошибки ключа и запроса переключением модели не лечатся — их не повторяем.
 async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
   const errors = []
+  const startedAt = Date.now()
 
   for (const model of MODELS) {
+    // Общий бюджет на все попытки. Если модели уже молчат дольше, чем
+    // собеседник готов ждать, дальше перебирать нет смысла.
+    if (Date.now() - startedAt > TOTAL_BUDGET_MS) {
+      errors.push(`дальше не пробовал: истёк общий лимит ${TOTAL_BUDGET_MS} мс`)
+      break
+    }
+
     try {
       const answer = await callModel(model, history, systemPrompt)
       if (model !== MODELS[0]) {
@@ -273,10 +291,14 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT) {
       // Неверный ключ, неверный запрос, нет доступа — следующая модель
       // даст ту же ошибку, только время потратим зря.
       if ([400, 401, 403, 404].includes(error.status)) break
+
+      // Прокси ответил, что модели нет или кончилась квота: перебор
+      // остальных моделей того же прокси не поможет.
+      if ([402, 429].includes(error.status)) break
     }
   }
 
-  throw new Error(`Не ответила ни одна модель. ${errors.join(". Резервная: ")}`)
+  throw new Error(`Не ответила ни одна модель. ${errors.join(" Резервная: ")}`)
 }
 
 // Общая функция для личных и Business-чатов. Сообщение собеседника уже
@@ -478,7 +500,7 @@ export function registerCommands(bot) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        notifyOwner(ctx.api, userText, ctx.from.id, `личка · ${senderName || ctx.from.id}`)
+        await notifyOwner(ctx.api, userText, ctx.from.id, `личка · ${senderName || ctx.from.id}`)
       }
 
       await ctx.replyWithChatAction("typing")
@@ -541,13 +563,13 @@ export function registerCommands(bot) {
 
       console.log(`[business] сообщение: chat=${ctx.chat.id} from=${ctx.from.id}`)
 
-      // Важное пересылаем владельцу в личку — до ответа, чтобы не терялось
-      // при ошибке модели.
+      // Важное пересылаем владельцу в личку первым делом и дожидаемся
+      // отправки: если модель упадёт, уведомление уже уйдёт.
       if (looksImportant(userText)) {
         const senderName = [ctx.from.first_name, ctx.from.last_name]
           .filter(Boolean)
           .join(" ")
-        notifyOwner(ctx.api, userText, ctx.from.id, senderName || `chat ${ctx.chat.id}`)
+        await notifyOwner(ctx.api, userText, ctx.from.id, senderName || `chat ${ctx.chat.id}`)
       }
 
       await ctx.api
