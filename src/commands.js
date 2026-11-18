@@ -456,10 +456,10 @@ function createDraft({ send, edit }) {
   let messageId = null
   let lastSent = ""
   let lastAt = 0
-  let pending = null
+  let sendFailed = false
 
   async function flush(full, force = false) {
-    if (!full) return
+    if (!full || sendFailed) return
     const now = Date.now()
     if (!force && now - lastAt < DRAFT_UPDATE_MS) return
     if (full === lastSent) return
@@ -476,16 +476,19 @@ function createDraft({ send, edit }) {
     } catch (error) {
       // Правка может не пройти, если текст не изменился или Telegram
       // ругается на частоту. Это не повод ломать ответ.
-      if (!/message is not modified/i.test(error.message)) {
-        console.error("[draft] не удалось обновить сообщение:", error.message)
-      }
+      if (/message is not modified/i.test(error.message)) return
+
+      console.error("[draft] не удалось обновить сообщение:", error.message)
+
+      // Первая отправка не прошла — дальше править нечего. Запоминаем,
+      // чтобы весь остаток ответа отправить одним сообщением в конце.
+      if (messageId === null) sendFailed = true
     }
   }
 
   return {
     onFirstToken: () => {},
     onDelta: async (_chunk, full) => {
-      pending = full
       await flush(full)
     },
     // Модель упала после начала ответа: убираем черновик, чтобы
@@ -496,11 +499,25 @@ function createDraft({ send, edit }) {
       }
       messageId = null
       lastSent = ""
-      pending = null
+      sendFailed = false
     },
+    // Возвращает true, если ответ дошёл до собеседника.
     async finish(full) {
+      if (!full) return false
+
+      if (sendFailed) {
+        // Стриминг не сработал — отправляем целиком.
+        try {
+          await send(full)
+          return true
+        } catch (error) {
+          console.error("[draft] не удалось отправить ответ:", error.message)
+          return false
+        }
+      }
+
       await flush(full, true)
-      return messageId
+      return messageId !== null
     },
   }
 }
@@ -574,10 +591,14 @@ async function notifyOwner(api, text, from, chatLabel, originalMessage = null) {
     return
   }
 
-  // Пересылаем исходное сообщение: в нём видно имя отправителя,
-  // и по нему открывается профиль. Если Telegram не разрешит переслать,
-  // пробуем копию — она содержит тот же текст, но без ссылки на автора.
-  if (originalMessage) {
+  // Пересылка работает только для обычных чатов. В Business сообщение
+  // принадлежит чужому соединению, и forward/copy оттуда Telegram
+  // отклоняет с BUSINESS_PEER_INVALID — после этого ломается и
+  // последующая отправка ответа в тот же чат. Поэтому для бизнес-чатов
+  // ограничиваемся текстом уведомления.
+  const canForward = originalMessage && !originalMessage.business_connection_id
+
+  if (canForward) {
     try {
       await api.forwardMessage(OWNER_TELEGRAM_ID, originalMessage.chat.id, originalMessage.message_id)
     } catch (error) {
@@ -802,7 +823,10 @@ export function registerCommands(bot) {
           ctx.from,
           senderName || `chat ${ctx.chat.id}`,
           ctx.businessMessage ?? null,
-        )
+        ).catch((error) => {
+          // Сбой уведомления не должен мешать ответу собеседнику.
+          console.error("[alert] уведомление не отправлено:", error.message)
+        })
       }
 
       await ctx.api
