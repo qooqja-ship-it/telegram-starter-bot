@@ -77,8 +77,25 @@ const IMPERSONATE = ["1", "true", "yes", "on"].includes(
 
 const OWNER_NAME = process.env.OWNER_NAME || "Магомед"
 
-// Кому присылать важные сообщения в личку.
+// Кому присылать важные сообщения и чей это аккаунт.
 const OWNER_TELEGRAM_ID = Number(process.env.OWNER_TELEGRAM_ID) || 0
+
+// Кому разрешено общаться с ботом в личке.
+// Business-переписка этим не ограничена: там бот отвечает всем, кто
+// пишет владельцу. А вот личка с самим ботом — только для владельца
+// и тех, кого он внёс в список.
+const ALLOWED_IN_PRIVATE = new Set(
+  (process.env.ALLOWED_PRIVATE_IDS || "")
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter(Boolean),
+)
+
+function canUsePrivate(fromId) {
+  if (!fromId) return false
+  if (fromId === OWNER_TELEGRAM_ID) return true
+  return ALLOWED_IN_PRIVATE.has(fromId)
+}
 
 const FALLBACK_PROMPT = `
 стиль:
@@ -685,6 +702,13 @@ export function registerCommands(bot) {
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim()
     if (!userText || userText.startsWith("/")) return
+
+    // В личку к боту пускаем только владельца и разрешённых.
+    // Business-переписка проверяется своим обработчиком ниже.
+    if (!canUsePrivate(ctx.from?.id)) {
+      console.log(`[private] посторонний ${ctx.from?.id} (${ctx.from?.username ?? "нет username"})`)
+      return
+    }
 
     const chatKey = `${ctx.chat.id}:${ctx.from.id}`
 
