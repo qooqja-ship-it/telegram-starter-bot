@@ -525,6 +525,23 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
 // вернуть маркер, уведомление всё равно уйдёт. Одинаковые сообщения от одного
 // собеседника не дублируются чаще раза в 10 минут.
 
+// «Печатает» гаснет через ~5 секунд, а модель думает дольше.
+// Пока идёт запрос, статус продлеваем, в конце гасим.
+function keepTyping(send) {
+  let stopped = false
+  const tick = () => {
+    if (stopped) return
+    Promise.resolve(send()).catch(() => {})
+  }
+  tick()
+  const timer = setInterval(tick, 4_000)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
 const ALERT_WORDS = [
   "срочно",
   "важно",
