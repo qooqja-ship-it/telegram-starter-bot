@@ -472,6 +472,15 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
 
 const DRAFT_UPDATE_MS = 900
 
+// Telegram сбрасывает «печатает» через 5 секунд, а ответ модели идёт
+// дольше. Продлеваем, пока ждём. Возвращает функцию остановки.
+function keepTyping(sendAction, intervalMs = 4000) {
+  sendAction()
+  const timer = setInterval(() => sendAction(), intervalMs)
+  timer.unref?.()
+  return () => clearInterval(timer)
+}
+
 function createDraft({ send, edit }) {
   let messageId = null
   let lastSent = ""
@@ -652,12 +661,16 @@ function loadStickers() {
 
 let stickerLibrary = new Map(Object.entries(loadStickers()))
 
+// Запись отложенная и асинхронная: синхронный writeFileSync в обработчике
+// сообщения блокирует событийный цикл на время записи файла.
+let stickerSaveTimer
 function saveStickersSoon() {
-  try {
-    fs.writeFileSync(STICKERS_FILE, JSON.stringify(Object.fromEntries(stickerLibrary)))
-  } catch (error) {
-    console.error("[stickers] не удалось сохранить:", error.message)
-  }
+  clearTimeout(stickerSaveTimer)
+  stickerSaveTimer = setTimeout(() => {
+    fs.promises
+      .writeFile(STICKERS_FILE, JSON.stringify(Object.fromEntries(stickerLibrary)))
+      .catch((error) => console.error("[stickers] не удалось сохранить:", error.message))
+  }, 1000)
 }
 
 export function registerCommands(bot) {
@@ -754,15 +767,28 @@ export function registerCommands(bot) {
     const chatKey = `${ctx.chat.id}:${ctx.from.id}`
 
     try {
-      // В личке уведомляем только если пишет не сам владелец.
-      if (ctx.from.id !== OWNER_TELEGRAM_ID && looksImportant(userText)) {
-        const senderName = [ctx.from.first_name, ctx.from.last_name]
-          .filter(Boolean)
-          .join(" ")
-        await notifyOwner(ctx.api, userText, ctx.from, `личка · ${senderName || ctx.from.id}`, ctx.message)
-      }
+      // «Печатает» ставим сразу и продлеваем, пока модель думает.
+      // Раньше был отдельный await перед запросом — это лишние 200 мс
+      // и мигание статуса на длинных ответах.
+      const stopTyping = keepTyping(() => ctx.replyWithChatAction("typing").catch(() => {}))
 
-      await ctx.replyWithChatAction("typing")
+      // Уведомление владельцу не должно задерживать ответ собеседнику,
+      // поэтому уходит параллельно.
+      const alerting =
+        ctx.from.id !== OWNER_TELEGRAM_ID && looksImportant(userText)
+          ? (() => {
+              const senderName = [ctx.from.first_name, ctx.from.last_name]
+                .filter(Boolean)
+                .join(" ")
+              return notifyOwner(
+                ctx.api,
+                userText,
+                ctx.from,
+                `личка · ${senderName || ctx.from.id}`,
+                ctx.message,
+              ).catch((error) => console.error("[alert] уведомление не ушло:", error.message))
+            })()
+          : null
 
       const draft = createDraft({
         send: async (text) => {
@@ -772,8 +798,15 @@ export function registerCommands(bot) {
         edit: (id, text) => ctx.api.editMessageText(ctx.chat.id, id, text),
       })
 
-      const answer = await askAI(chatKey, userText, "private", ctx.from, draft)
+      let answer
+      try {
+        answer = await askAI(chatKey, userText, "private", ctx.from, draft)
+      } finally {
+        stopTyping()
+      }
+
       await draft.finish(answer)
+      if (alerting) await alerting
     } catch (error) {
       console.error("[Lareper error]", error.message)
       await ctx.reply(
@@ -831,27 +864,28 @@ export function registerCommands(bot) {
 
       console.log(`[business] сообщение: chat=${ctx.chat.id} from=${ctx.from.id}`)
 
-      // Важное пересылаем владельцу в личку первым делом и дожидаемся
-      // отправки: если модель упадёт, уведомление уже уйдёт.
-      if (looksImportant(userText)) {
-        const senderName = [ctx.from.first_name, ctx.from.last_name]
-          .filter(Boolean)
-          .join(" ")
-        await notifyOwner(
-          ctx.api,
-          userText,
-          ctx.from,
-          senderName || `chat ${ctx.chat.id}`,
-          ctx.businessMessage ?? null,
-        ).catch((error) => {
-          // Сбой уведомления не должен мешать ответу собеседнику.
-          console.error("[alert] уведомление не отправлено:", error.message)
-        })
-      }
+      // Уведомление и «печатает» запускаем параллельно с запросом к модели.
+      const alerting = looksImportant(userText)
+        ? (() => {
+            const senderName = [ctx.from.first_name, ctx.from.last_name]
+              .filter(Boolean)
+              .join(" ")
+            return notifyOwner(
+              ctx.api,
+              userText,
+              ctx.from,
+              senderName || `chat ${ctx.chat.id}`,
+              ctx.businessMessage ?? null,
+            ).catch((error) => {
+              // Сбой уведомления не должен мешать ответу собеседнику.
+              console.error("[alert] уведомление не отправлено:", error.message)
+            })
+          })()
+        : null
 
-      await ctx.api
-        .sendChatAction(ctx.chat.id, "typing", { business_connection_id: connectionId })
-        .catch(() => {})
+      const stopTyping = keepTyping(() =>
+        ctx.api.sendChatAction(ctx.chat.id, "typing", { business_connection_id: connectionId }).catch(() => {}),
+      )
 
       const draft = createDraft({
         send: async (text) => {
@@ -866,7 +900,13 @@ export function registerCommands(bot) {
           }),
       })
 
-      const answer = await askAI(chatKey, userText, "business", ctx.from, draft)
+      let answer
+      try {
+        answer = await askAI(chatKey, userText, "business", ctx.from, draft)
+      } finally {
+        stopTyping()
+      }
+      if (alerting) await alerting
       await draft.finish(answer)
     } catch (error) {
       // В чужой переписке технические ошибки не отправляем.

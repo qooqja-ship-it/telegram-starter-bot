@@ -6,7 +6,7 @@
 //
 // Разбор SSE сделан вручную: формат простой, лишняя зависимость не нужна.
 
-export class AiError extends Error {
+class AiError extends Error {
   constructor(message, status) {
     super(message)
     this.name = "AiError"
@@ -15,7 +15,7 @@ export class AiError extends Error {
 }
 
 // Разбирает поток `data: {...}` построчно. Возвращает куски текста.
-export function parseSseChunk(buffer) {
+function parseSseChunk(buffer) {
   const events = []
   let rest = buffer
 

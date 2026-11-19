@@ -32,8 +32,7 @@ function resolveDataDir() {
 export const DATA_DIR = resolveDataDir()
 export const DB_PATH = path.join(DATA_DIR, "bot.sqlite")
 
-export const db = new Database(DB_PATH)
-
+const db = new Database(DB_PATH)
 db.pragma("journal_mode = WAL")
 db.pragma("foreign_keys = ON")
 db.pragma("busy_timeout = 5000")
@@ -106,16 +105,9 @@ const stmtRecentMessages = db.prepare(`
   ORDER BY id DESC
   LIMIT ?
 `)
-const stmtLastMessage = db.prepare(`
-  SELECT sender_type, content, created_at
-  FROM messages
-  WHERE chat_id = ?
-  ORDER BY id DESC
-  LIMIT 1
-`)
 const stmtCount = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?")
 
-export function ensureChat(chatKey, chatType = "private") {
+function ensureChat(chatKey, chatType = "private") {
   stmtInsertChat.run(chatKey, chatType)
   return stmtChatId.get(chatKey).id
 }
@@ -124,12 +116,6 @@ export function addMessage(chatKey, senderType, content, chatType = "private", m
   const chatId = ensureChat(chatKey, chatType)
   stmtInsertMessage.run(chatId, senderType, messageType, content)
   return chatId
-}
-
-export function lastMessage(chatKey) {
-  const chatId = stmtChatId.get(chatKey)?.id
-  if (!chatId) return null
-  return stmtLastMessage.get(chatId) ?? null
 }
 
 // Возвращает последние сообщения в хронологическом порядке.
@@ -270,4 +256,3 @@ export function autoMigrate() {
 }
 
 console.log("[SQLite] База данных открыта:", DB_PATH)
-export { LEGACY_FLAG }
