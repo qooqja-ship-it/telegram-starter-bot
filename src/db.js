@@ -65,6 +65,17 @@ db.exec(`
     FOREIGN KEY(chat_id) REFERENCES chats(id)
   );
 
+  -- Настройки на каждый чат: включён ли бот, с какого сообщения
+  -- считать историю. enabled=0 — бот в этом чате молчит.
+  CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    reset_after_id INTEGER NOT NULL DEFAULT 0,
+    romantic INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(chat_id) REFERENCES chats(id)
+  );
+
   CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER,
@@ -101,7 +112,7 @@ const stmtInsertMessage = db.prepare(
 const stmtRecentMessages = db.prepare(`
   SELECT sender_type, content, created_at
   FROM messages
-  WHERE chat_id = ?
+  WHERE chat_id = ? AND id > ?
   ORDER BY id DESC
   LIMIT ?
 `)
@@ -120,12 +131,16 @@ export function addMessage(chatKey, senderType, content, chatType = "private", m
 
 // Возвращает последние сообщения в хронологическом порядке.
 // Роли для модели: реплики собеседника — user, всё остальное — assistant.
+// Сообщения до точки сброса не отдаём: история начинается с чистого листа,
+// но старые данные остаются в базе.
 export function recentMessages(chatKey, limit = 12) {
   const chatId = stmtChatId.get(chatKey)?.id
   if (!chatId) return []
 
+  const { reset_after_id: afterId } = chatSettings(chatKey)
+
   return stmtRecentMessages
-    .all(chatId, limit)
+    .all(chatId, afterId, limit)
     .reverse()
     .map((row) => ({
       role: row.sender_type === "user" ? "user" : "assistant",
@@ -133,6 +148,82 @@ export function recentMessages(chatKey, limit = 12) {
       senderType: row.sender_type,
       createdAt: row.created_at,
     }))
+}
+
+// --- Настройки чата ------------------------------------------------------------
+
+const stmtSettings = db.prepare(
+  "SELECT enabled, reset_after_id, romantic FROM chat_settings WHERE chat_id = ?",
+)
+const stmtUpsertSettings = db.prepare(`
+  INSERT INTO chat_settings (chat_id, enabled, reset_after_id, romantic)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(chat_id) DO UPDATE SET
+    enabled = excluded.enabled,
+    reset_after_id = excluded.reset_after_id,
+    romantic = excluded.romantic,
+    updated_at = CURRENT_TIMESTAMP
+`)
+
+export function chatSettings(chatKey) {
+  const chatId = stmtChatId.get(chatKey)?.id
+  if (!chatId) return { enabled: true, reset_after_id: 0, romantic: 0 }
+
+  return (
+    stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0, romantic: 0 }
+  )
+}
+
+function saveSettings(chatId, { enabled, reset_after_id, romantic }) {
+  stmtUpsertSettings.run(chatId, enabled ? 1 : 0, reset_after_id, romantic ? 1 : 0)
+}
+
+// Включить или выключить бота в одном чате.
+export function setChatEnabled(chatKey, enabled, chatType = "private") {
+  const chatId = ensureChat(chatKey, chatType)
+  const current = stmtSettings.get(chatId) ?? { reset_after_id: 0, romantic: 0 }
+  saveSettings(chatId, {
+    enabled,
+    reset_after_id: current.reset_after_id,
+    romantic: current.romantic,
+  })
+  return enabled
+}
+
+export function isChatEnabled(chatKey) {
+  return Boolean(chatSettings(chatKey).enabled)
+}
+
+// Включить романтический стиль в конкретном чате.
+export function setChatRomantic(chatKey, romantic, chatType = "private") {
+  const chatId = ensureChat(chatKey, chatType)
+  const current = stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0 }
+  saveSettings(chatId, {
+    enabled: current.enabled,
+    reset_after_id: current.reset_after_id,
+    romantic,
+  })
+  return romantic
+}
+
+// Начать историю заново, не удаляя старые сообщения.
+// Модель перестаёт их видеть, в базе они остаются.
+export function resetChatHistory(chatKey) {
+  const chatId = stmtChatId.get(chatKey)?.id
+  if (!chatId) return { reset: false, kept: 0 }
+
+  const lastId = db
+    .prepare("SELECT COALESCE(MAX(id), 0) AS n FROM messages WHERE chat_id = ?")
+    .get(chatId).n
+
+  const current = stmtSettings.get(chatId) ?? { enabled: 1, romantic: 0 }
+  saveSettings(chatId, {
+    enabled: current.enabled,
+    reset_after_id: lastId,
+    romantic: current.romantic,
+  })
+
+  return { reset: true, kept: lastId }
 }
 
 export function deleteChat(chatKey) {
@@ -143,6 +234,7 @@ export function deleteChat(chatKey) {
     db.prepare("DELETE FROM profiles WHERE chat_id = ?").run(chatId)
     db.prepare("DELETE FROM summaries WHERE chat_id = ?").run(chatId)
     db.prepare("DELETE FROM memories WHERE chat_id = ?").run(chatId)
+    db.prepare("DELETE FROM chat_settings WHERE chat_id = ?").run(chatId)
     db.prepare("DELETE FROM chats WHERE id = ?").run(chatId)
   })()
   return changes
@@ -157,6 +249,22 @@ export function stats() {
 export function messageCount(chatKey) {
   const chatId = stmtChatId.get(chatKey)?.id
   return chatId ? stmtCount.get(chatId).n : 0
+}
+
+// Список чатов для команды /chats: ключ, состояние и число сообщений.
+export function listChats(limit = 30) {
+  return db
+    .prepare(`
+      SELECT c.chat_key,
+             COALESCE(s.enabled, 1) AS enabled,
+             COALESCE(s.romantic, 0) AS romantic,
+             (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS messages
+      FROM chats c
+      LEFT JOIN chat_settings s ON s.chat_id = c.id
+      ORDER BY messages DESC
+      LIMIT ?
+    `)
+    .all(limit)
 }
 
 // --- Миграция старой истории из conversations.json ---------------------------

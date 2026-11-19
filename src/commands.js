@@ -5,9 +5,15 @@ import { streamModel } from "./ai.js"
 import {
   DATA_DIR,
   addMessage,
+  chatSettings,
   deleteChat,
+  isChatEnabled,
+  listChats,
   messageCount,
   recentMessages,
+  resetChatHistory,
+  setChatEnabled,
+  setChatRomantic,
   stats,
 } from "./db.js"
 
@@ -70,6 +76,7 @@ const ABOUT_ME =
 
 const STYLE_PROMPT = readPromptFile("communication_style.md")
 const RULES_PROMPT = readPromptFile("behavior_rules.md")
+const ROMANTIC_PROMPT = readPromptFile("romantic_style.md")
 
 // Режим «пишу от имени владельца». Включается через IMPERSONATE=1.
 // Выключен по умолчанию: переключатель в одну переменную окружения.
@@ -191,6 +198,12 @@ function systemPromptFor(from, context = {}) {
 
   const addressee = addresseeBlock(from, context)
   if (addressee) parts.push(addressee)
+
+  // Романтический стиль включается только для этого чата и только когда
+  // в базе стоит флаг. Остальные переписки он не касается.
+  if (context.romantic && ROMANTIC_PROMPT) {
+    parts.push("контекст этого разговора: личное, романтическое общение.\n\n" + ROMANTIC_PROMPT)
+  }
 
   const now = nowBlock()
   if (now) parts.push(now)
@@ -452,10 +465,16 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
+  const settings = chatSettings(chatKey)
+
   try {
     const result = await callWithFallback(
       history,
-      systemPromptFor(from, { ...context, chatKind: chatType }),
+      systemPromptFor(from, {
+        ...context,
+        chatKind: chatType,
+        romantic: Boolean(settings.romantic),
+      }),
       hooks,
     )
     addMessage(chatKey, "assistant", result.answer, chatType)
@@ -673,6 +692,13 @@ function saveStickersSoon() {
   }, 1000)
 }
 
+// Команды управления доступны только владельцу. В Business /stop и /on
+// приходят из чужого чата, поэтому проверяем именно автора сообщения.
+function isOwner(ctx) {
+  if (!OWNER_TELEGRAM_ID) return false
+  return ctx.from?.id === OWNER_TELEGRAM_ID
+}
+
 export function registerCommands(bot) {
   bot.command("start", (ctx) =>
     ctx.reply(
@@ -733,9 +759,56 @@ export function registerCommands(bot) {
   )
 
   bot.command("reset", (ctx) => {
-    deleteChat(`${ctx.chat.id}:${ctx.from.id}`)
-    deleteChat(`biz:${ctx.chat.id}`)
-    return ctx.reply("Память этого диалога очищена. Начинаем с чистого листа!")
+    // Мягкий сброс: модель начинает с чистого листа, старые сообщения
+    // остаются в базе как материал.
+    const privateKey = `${ctx.chat.id}:${ctx.from.id}`
+    const businessKey = `biz:${ctx.chat.id}`
+    resetChatHistory(privateKey)
+    resetChatHistory(businessKey)
+    return ctx.reply("История этого чата начата заново. Старые сообщения сохранены в базе.")
+  })
+
+  // Выключить бота в текущем чате. Работает и в Business, где /stop
+  // прилетает от собеседника редко, поэтому дополнительно есть кнопка
+  // в личке владельца.
+  bot.command("stop", (ctx) => {
+    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
+    const key = `biz:${ctx.chat.id}`
+    setChatEnabled(key, false, "business")
+    return ctx.reply(`Бот выключен в чате ${ctx.chat.id}.`)
+  })
+
+  bot.command("on", (ctx) => {
+    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
+    const key = `biz:${ctx.chat.id}`
+    setChatEnabled(key, true, "business")
+    return ctx.reply(`Бот снова включён в чате ${ctx.chat.id}.`)
+  })
+
+  // Включить романтический стиль в конкретном чате.
+  bot.command("romantic", (ctx) => {
+    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
+    const arg = ctx.message.text.split(/\s+/)[1]?.toLowerCase()
+    const key = `biz:${ctx.chat.id}`
+    const on = arg !== "off"
+    setChatRomantic(key, on, "business")
+    return ctx.reply(
+      on
+        ? `Романтический стиль включён в чате ${ctx.chat.id}.`
+        : `Романтический стиль выключен в чате ${ctx.chat.id}.`,
+    )
+  })
+
+  // Список чатов с состоянием: где бот включён, где романтический стиль.
+  bot.command("chats", (ctx) => {
+    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
+    const rows = listChats(30)
+    if (!rows.length) return ctx.reply("Пока ни одного чата в базе.")
+    const lines = rows.map(
+      (row) =>
+        `${row.chat_key} · ${row.enabled ? "вкл" : "ВЫКЛ"}${row.romantic ? " · романтика" : ""} · ${row.messages} сообщ.`,
+    )
+    return ctx.reply(["Чаты:", "", ...lines].join("\n"))
   })
 
   bot.command("stickers", (ctx) => {
@@ -848,6 +921,13 @@ export function registerCommands(bot) {
       if (!connection?.is_enabled) return
 
       const chatKey = `biz:${ctx.chat.id}`
+
+      // Бот мог быть выключен в этом чате вручную. Тогда молчим, но
+      // сообщения всё равно записываем, чтобы история не терялась.
+      if (!isChatEnabled(chatKey) && !userText.startsWith("/")) {
+        addMessage(chatKey, "user", userText, "business")
+        return
+      }
 
       // Сообщения владельца запоминаем отдельно, как owner, — бот не должен
       // принимать их за свои прошлые ответы.
