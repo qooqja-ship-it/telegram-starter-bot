@@ -472,17 +472,13 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
-  try {
-    const result = await callWithFallback(
-      history,
-      systemPromptFor(from, { ...context, chatKind: chatType }),
-      hooks,
-    )
-    addMessage(chatKey, "assistant", result.answer, chatType)
-    return result.answer
-  } catch (error) {
-    throw error
-  }
+  const result = await callWithFallback(
+    history,
+    systemPromptFor(from, { ...context, chatKind: chatType }),
+    hooks,
+  )
+  addMessage(chatKey, "assistant", result.answer, chatType)
+  return result.answer
 }
 
 // --- Живой набор в Telegram --------------------------------------------------
@@ -700,6 +696,24 @@ function isOwner(ctx) {
   return ctx.from?.id === OWNER_TELEGRAM_ID
 }
 
+// Определяет, какой Business-чат имеет в виду команда.
+// Из Business-чата — текущий. Из лички — тот, чей id указан аргументом.
+// Без этого /stop из лички выключал несуществующий чат с id владельца.
+function resolveBusinessTarget(ctx) {
+  const arg = ctx.message?.text?.split(/\s+/)[1]
+
+  if (arg) {
+    const id = Number(arg.replace(/^biz:/, ""))
+    if (!Number.isInteger(id) || id <= 0) return null
+    return `biz:${id}`
+  }
+
+  // Без аргумента команда имеет смысл только внутри Business-чата.
+  if (ctx.businessConnectionId) return `biz:${ctx.chat.id}`
+
+  return null
+}
+
 export function registerCommands(bot) {
   bot.command("start", (ctx) =>
     ctx.reply(
@@ -762,28 +776,49 @@ export function registerCommands(bot) {
   bot.command("reset", (ctx) => {
     // Мягкий сброс: модель начинает с чистого листа, старые сообщения
     // остаются в базе как материал.
-    const privateKey = `${ctx.chat.id}:${ctx.from.id}`
-    const businessKey = `biz:${ctx.chat.id}`
-    resetChatHistory(privateKey)
-    resetChatHistory(businessKey)
+    // В Business сбрасываем этот чат. В личке с ботом — только личку:
+    // раньше здесь задевался biz-ключ с чужим id.
+    if (ctx.chat.type === "private" && ctx.from.id !== OWNER_TELEGRAM_ID) {
+      resetChatHistory(`${ctx.chat.id}:${ctx.from.id}`)
+      return ctx.reply("История этого чата начата заново.")
+    }
+
+    resetChatHistory(`${ctx.chat.id}:${ctx.from.id}`)
+    resetChatHistory(`biz:${ctx.chat.id}`)
     return ctx.reply("История этого чата начата заново. Старые сообщения сохранены в базе.")
   })
 
-  // Выключить бота в текущем чате. Работает и в Business, где /stop
-  // прилетает от собеседника редко, поэтому дополнительно есть кнопка
-  // в личке владельца.
+  // Выключить бота в чате. Пишется из лички владельца с указанием id:
+  // /stop 123456789
+  // Из Business-чата без аргумента выключается текущий чат.
   bot.command("stop", (ctx) => {
     if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
-    const key = `biz:${ctx.chat.id}`
-    setChatEnabled(key, false, "business")
-    return ctx.reply(`Бот выключен в чате ${ctx.chat.id}.`)
+
+    const target = resolveBusinessTarget(ctx)
+    if (!target) {
+      return ctx.reply(
+        "Укажи id чата: /stop 123456789\n" +
+          "Список чатов с id: /chats id",
+      )
+    }
+
+    setChatEnabled(target, false, "business")
+    return ctx.reply(`Бот выключен в чате ${target}.`)
   })
 
   bot.command("on", (ctx) => {
     if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
-    const key = `biz:${ctx.chat.id}`
-    setChatEnabled(key, true, "business")
-    return ctx.reply(`Бот снова включён в чате ${ctx.chat.id}.`)
+
+    const target = resolveBusinessTarget(ctx)
+    if (!target) {
+      return ctx.reply(
+        "Укажи id чата: /on 123456789\n" +
+          "Список чатов с id: /chats id",
+      )
+    }
+
+    setChatEnabled(target, true, "business")
+    return ctx.reply(`Бот снова включён в чате ${target}.`)
   })
 
   // Список чатов: где бот включён и сколько сообщений.
@@ -795,7 +830,16 @@ export function registerCommands(bot) {
       (row) =>
         `${row.chat_key} · ${row.enabled ? "вкл" : "ВЫКЛ"} · ${row.messages} сообщ.`,
     )
-    return ctx.reply(["Чаты:", "", ...lines].join("\n"))
+    return ctx.reply(
+      [
+        "Чаты:",
+        "",
+        ...lines,
+        "",
+        "Выключить: /stop <id>",
+        "Включить: /on <id>",
+      ].join("\n"),
+    )
   })
 
   bot.command("stickers", (ctx) => {
@@ -973,7 +1017,8 @@ export function registerCommands(bot) {
       } finally {
         stopTyping()
       }
-      if (alerting) await alerting
+
+      // Ответ показываем первым, уведомление догоняет.
       await draft.finish(answer)
     } catch (error) {
       // В чужой переписке технические ошибки не отправляем.
@@ -981,6 +1026,10 @@ export function registerCommands(bot) {
         `[business chat error] chat=${ctx.chat.id} from=${ctx.from.id}:`,
         error.message,
       )
+    } finally {
+      // Уведомление дожидается в любом случае: если модель упала,
+      // владелец всё равно должен узнать о важном сообщении.
+      if (alerting) await alerting.catch(() => {})
     }
   })
 }

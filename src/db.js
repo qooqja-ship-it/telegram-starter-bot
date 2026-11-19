@@ -163,7 +163,7 @@ const stmtUpsertSettings = db.prepare(`
     updated_at = CURRENT_TIMESTAMP
 `)
 
-export function chatSettings(chatKey) {
+function chatSettings(chatKey) {
   const chatId = stmtChatId.get(chatKey)?.id
   if (!chatId) return { enabled: true, reset_after_id: 0 }
 
