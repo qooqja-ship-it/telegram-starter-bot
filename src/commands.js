@@ -941,6 +941,9 @@ export function registerCommands(bot) {
       // встречу именно сейчас, и один раз сообщим владельцу.
       const stageBefore = getStage(chatKey)
 
+      // Объявлено до try, иначе finally его не видит.
+      let alerting = null
+
       // Бот мог быть выключен в этом чате вручную. Тогда молчим, но
       // сообщения всё равно записываем, чтобы история не терялась.
       if (!isChatEnabled(chatKey) && !userText.startsWith("/")) {
@@ -964,7 +967,7 @@ export function registerCommands(bot) {
       console.log(`[business] сообщение: chat=${ctx.chat.id} from=${ctx.from.id}`)
 
       // Уведомление и «печатает» запускаем параллельно с запросом к модели.
-      const alerting = looksImportant(userText)
+      alerting = looksImportant(userText)
         ? (() => {
             const senderName = [ctx.from.first_name, ctx.from.last_name]
               .filter(Boolean)
