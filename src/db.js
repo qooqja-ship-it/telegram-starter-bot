@@ -115,6 +115,8 @@ function ensureColumn(table, column, definition) {
 
 ensureColumn("chat_settings", "stage", "INTEGER NOT NULL DEFAULT 0")
 ensureColumn("chat_settings", "stage_changed_at", "TEXT")
+// Когда бот последний раз сам начинал разговор после паузы.
+ensureColumn("chat_settings", "nudge_at", "TEXT")
 
 // --- Запросы -----------------------------------------------------------------
 
@@ -316,6 +318,74 @@ export function listChats(limit = 30) {
       LIMIT ?
     `)
     .all(limit)
+}
+
+// --- Молчащие чаты -------------------------------------------------------------
+// Нужны, чтобы бот сам возобновлял разговор после долгой паузы.
+// Берём только те чаты, где бот включён и где переписка уже дошла
+// до личного этапа: в рабочем чате инициатива неуместна.
+
+const stmtQuietChats = db.prepare(`
+  SELECT c.chat_key,
+         c.chat_type,
+         s.stage,
+         m.sender_type AS last_sender,
+         m.created_at  AS last_at
+  FROM chats c
+  JOIN chat_settings s ON s.chat_id = c.id
+  JOIN messages m ON m.id = (
+    SELECT MAX(id) FROM messages WHERE chat_id = c.id
+  )
+  WHERE c.chat_type = 'business'
+    AND s.enabled = 1
+    AND s.stage > 0
+    AND m.id > s.reset_after_id
+  ORDER BY m.created_at ASC
+`)
+
+export function quietChats() {
+  return stmtQuietChats.all()
+}
+
+// Ключ чата в базе хранится как biz:<id>, наружу отдаём числовой chat id,
+// чтобы было куда отправить сообщение.
+export function chatIdFromKey(chatKey) {
+  const match = /^biz:(\d+)$/.exec(chatKey)
+  return match ? Number(match[1]) : null
+}
+
+// Когда бот последний раз писал в этот чат. Нужно как защита от повторов:
+// даже если собеседник молчит, докучать ему раз в сутки нельзя.
+export function lastBotMessageAt(chatKey) {
+  const chatId = chatIdOf(chatKey)
+  if (!chatId) return null
+
+  const row = db
+    .prepare(`
+      SELECT created_at FROM messages
+      WHERE chat_id = ? AND sender_type = 'assistant'
+      ORDER BY id DESC LIMIT 1
+    `)
+    .get(chatId)
+
+  return row?.created_at ?? null
+}
+
+// Отметка «бот сам написал в этот чат», чтобы не писать дважды.
+export function markNudge(chatKey, value) {
+  const chatId = chatIdOf(chatKey)
+  if (!chatId) return
+  db.prepare(`
+    INSERT INTO chat_settings (chat_id, nudge_at) VALUES (?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET nudge_at = excluded.nudge_at
+  `).run(chatId, value)
+}
+
+export function nudgeAt(chatKey) {
+  const chatId = chatIdOf(chatKey)
+  if (!chatId) return null
+  const row = db.prepare("SELECT nudge_at FROM chat_settings WHERE chat_id = ?").get(chatId)
+  return row?.nudge_at ?? null
 }
 
 // --- Миграция старой истории из conversations.json ---------------------------

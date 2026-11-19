@@ -5,12 +5,17 @@ import { streamModel } from "./ai.js"
 import {
   DATA_DIR,
   addMessage,
+  chatIdFromKey,
   deleteChat,
   isChatEnabled,
   getStage,
   setStage,
+  lastBotMessageAt,
   listChats,
+  markNudge,
   messageCount,
+  nudgeAt,
+  quietChats,
   recentMessages,
   resetChatHistory,
   setChatEnabled,
@@ -79,6 +84,7 @@ const ABOUT_ME =
 const STYLE_PROMPT = readPromptFile("communication_style.md")
 const RULES_PROMPT = readPromptFile("behavior_rules.md")
 const ROMANTIC_PROMPT = readPromptFile("romantic_style.md")
+const REENGAGE_PROMPT = readPromptFile("reengage_style.md")
 
 // Романтический стиль включается переменной в FadeHost, а не командой
 // в чате: переключать в каждом диалоге неудобно.
@@ -679,6 +685,156 @@ function saveStickersSoon() {
   }, 1000)
 }
 
+// --- Повторный заход после паузы ----------------------------------------------
+// Бот сам начинает разговор, если собеседница давно молчит. Работает только
+// в личных Business-чатах на этапах знакомства: в рабочем чате инициатива
+// выглядела бы странно.
+//
+// Порог в часах. Ставится переменной NUDGE_AFTER_HOURS, 0 отключает заходы.
+const NUDGE_AFTER_HOURS = Number(process.env.NUDGE_AFTER_HOURS ?? 20)
+// Даже если проигнорировали, чаще раза в сутки бот не пишет.
+const NUDGE_COOLDOWN_HOURS = 24
+// Не больше одного захода за один проход планировщика, чтобы пачка
+// сообщений не улетела людям одновременно.
+const NUDGE_PER_TICK = 1
+// Молчим ночью по Махачкале: с 23 до 9 утра писать незнакомому человеку нельзя.
+const QUIET_FROM_HOUR = 23
+const QUIET_TO_HOUR = 9
+
+const HOUR_MS = 60 * 60 * 1000
+
+function hoursSince(dateLike) {
+  if (!dateLike) return Infinity
+  const at = Date.parse(String(dateLike).replace(" ", "T") + "Z")
+  if (Number.isNaN(at)) return Infinity
+  return (Date.now() - at) / HOUR_MS
+}
+
+// Время в базе хранится как CURRENT_TIMESTAMP, это UTC.
+function localHour() {
+  const parts = MAKHACHKALA_FMT.formatToParts(new Date())
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0)
+  return Number.isNaN(hour) ? 0 : hour
+}
+
+function isQuietTime() {
+  const hour = localHour()
+  return hour >= QUIET_FROM_HOUR || hour < QUIET_TO_HOUR
+}
+
+// Готовое сообщение-заход. Историю берём ту же, что и для обычных ответов,
+// но с отдельной системной инструкцией: задача другая.
+async function buildNudge(chatKey, stage) {
+  const history = recentMessages(chatKey, MAX_HISTORY)
+  if (!history.length) return null
+
+  const prompt = [
+    SYSTEM_PROMPT,
+    REENGAGE_PROMPT || "напиши первым короткое сообщение, чтобы возобновить разговор.",
+    `сейчас разговор на этапе ${stage}. заходи мягко, без флирта в первом сообщении.`,
+    nowBlock(),
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+
+  const result = await callWithFallback(history, prompt)
+  const { text } = extractStage(result.answer)
+  return text || null
+}
+
+async function runNudge(api, chatKey, chatId, stage) {
+  let text
+  try {
+    text = await buildNudge(chatKey, stage)
+  } catch (error) {
+    console.error(`[nudge] ${chatKey}: модель не ответила:`, error.message)
+    return false
+  }
+
+  if (!text) return false
+
+  // Заход засчитываем до отправки: если отправка упадёт, повторной
+  // попытки в этом проходе не будет, и собеседник не получит дубль.
+  markNudge(chatKey, new Date().toISOString())
+
+  try {
+    const connectionId = await businessConnectionIdFor(api, chatId)
+    if (!connectionId) {
+      console.log(`[nudge] ${chatKey}: нет активного соединения, пропуск`)
+      return false
+    }
+
+    await api.sendMessage(chatId, text, { business_connection_id: connectionId })
+    addMessage(chatKey, "assistant", text, "business")
+    console.log(`[nudge] ${chatKey}: написал первым после паузы`)
+  } catch (error) {
+    console.error(`[nudge] ${chatKey}: не удалось отправить:`, error.message)
+  }
+
+  return true
+}
+
+// У бота одно Business-соединение на владельца. Кэшируем на минуту,
+// чтобы не запрашивать его в каждом проходе планировщика.
+let connectionCache = { at: 0, id: null }
+
+async function businessConnectionIdFor(api, chatId) {
+  if (connectionCache.id && Date.now() - connectionCache.at < 60_000) {
+    return connectionCache.id
+  }
+
+  const connections = await api.getBusinessConnection(chatId).catch(() => null)
+  const id = connections?.id ?? null
+  connectionCache = { at: Date.now(), id }
+  return id
+}
+
+async function nudgeLoop(api) {
+  if (!(NUDGE_AFTER_HOURS > 0)) return
+  if (isQuietTime()) return
+
+  let sent = 0
+  for (const chat of quietChats()) {
+    if (sent >= NUDGE_PER_TICK) break
+
+    // Инициатива уместна только если последним писал собеседник.
+    // Если последняя реплика наша, ждём её, а не догоняем.
+    if (chat.last_sender !== "user") continue
+
+    const chatKey = chat.chat_key
+    const silentHours = hoursSince(chat.last_at)
+    if (silentHours < NUDGE_AFTER_HOURS) continue
+
+    if (hoursSince(nudgeAt(chatKey)) < NUDGE_COOLDOWN_HOURS) continue
+
+    const chatId = chatIdFromKey(chatKey)
+    if (!chatId) continue
+
+    // Если в чате уже есть наша реплика после её последнего сообщения,
+    // догонять не нужно.
+    if (hoursSince(lastBotMessageAt(chatKey)) < silentHours) continue
+
+    if (await runNudge(api, chatKey, chatId, chat.stage)) sent += 1
+  }
+}
+
+// Смотрим раз в 15 минут: точность до минуты здесь не нужна.
+const NUDGE_TICK_MS = 15 * 60 * 1000
+
+function startNudgeLoop(api) {
+  if (!(NUDGE_AFTER_HOURS > 0)) {
+    console.log("[nudge] повторные заходы выключены")
+    return
+  }
+
+  console.log(`[nudge] включены: пауза от ${NUDGE_AFTER_HOURS} ч, не чаще раза в сутки`)
+  const timer = setInterval(() => {
+    nudgeLoop(api).catch((error) => console.error("[nudge] проход упал:", error.message))
+  }, NUDGE_TICK_MS)
+  timer.unref?.()
+}
+
+
 // Команды управления доступны только владельцу. В Business /stop и /on
 // приходят из чужого чата, поэтому проверяем именно автора сообщения.
 function isOwner(ctx) {
@@ -705,6 +861,8 @@ function resolveBusinessTarget(ctx) {
 }
 
 export function registerCommands(bot) {
+  startNudgeLoop(bot.api)
+
   bot.command("start", (ctx) =>
     ctx.reply(
       IMPERSONATE
