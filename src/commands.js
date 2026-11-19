@@ -152,10 +152,13 @@ function addresseeBlock(from, context = {}) {
 
   const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ").trim()
   if (name) {
-    parts.push(`собеседник: ${name}.`)
+    parts.push(`имя в профиле Telegram: ${name}. это может быть ник, а не настоящее имя.`)
+    parts.push("по имени не обращайся и здоровайся без имени: не начинай сообщение с него.")
+    parts.push("не принимай за имя слова из её сообщений: профессию, город, увлечение,")
+    parts.push("название учебного заведения и всё остальное, что она о себе рассказывает.")
     if (context.chatKind === "business") {
-      parts.push("пол собеседника не указан явно. определяй его по речи и по ходу разговора,")
-      parts.push("и обращайся так, как он сам о себе говорит. пока неясно - пиши нейтрально,")
+      parts.push("пол собеседника в профиле не указан. определяй его по речи и по ходу разговора,")
+      parts.push("и пиши так, как говорит о себе собеседник. пока неясно - пиши нейтрально,")
       parts.push("без «он», «она», «друг», «красавица» и без обращений в мужском или женском роде.")
     } else {
       parts.push("род собеседника не указан. не угадывай пол по имени.")
@@ -163,8 +166,6 @@ function addresseeBlock(from, context = {}) {
       parts.push("без обращений в мужском или женском роде.")
     }
   }
-
-  if (name) parts.push(`обращайся к нему по имени, если это уместно: ${name.split(" ")[0]}.`)
 
   const username = from?.username ? `@${from.username}` : null
   if (username) parts.push(`его username: ${username}.`)
