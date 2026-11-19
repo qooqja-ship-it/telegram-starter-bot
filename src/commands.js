@@ -5,7 +5,6 @@ import { streamModel } from "./ai.js"
 import {
   DATA_DIR,
   addMessage,
-  chatSettings,
   deleteChat,
   isChatEnabled,
   listChats,
@@ -13,7 +12,6 @@ import {
   recentMessages,
   resetChatHistory,
   setChatEnabled,
-  setChatRomantic,
   stats,
 } from "./db.js"
 
@@ -77,6 +75,13 @@ const ABOUT_ME =
 const STYLE_PROMPT = readPromptFile("communication_style.md")
 const RULES_PROMPT = readPromptFile("behavior_rules.md")
 const ROMANTIC_PROMPT = readPromptFile("romantic_style.md")
+
+// Романтический стиль включается переменной в FadeHost, а не командой
+// в чате: переключать в каждом диалоге неудобно.
+// ROMANTIC=1 — включён во всех Business-переписках.
+const ROMANTIC = ["1", "true", "yes", "on"].includes(
+  (process.env.ROMANTIC || "").trim().toLowerCase(),
+)
 
 // Режим «пишу от имени владельца». Включается через IMPERSONATE=1.
 // Выключен по умолчанию: переключатель в одну переменную окружения.
@@ -201,7 +206,9 @@ function systemPromptFor(from, context = {}) {
 
   // Романтический стиль включается только для этого чата и только когда
   // в базе стоит флаг. Остальные переписки он не касается.
-  if (context.romantic && ROMANTIC_PROMPT) {
+  // Романтический стиль: глобальный флаг из переменной окружения.
+  // В личке с самим ботом он не нужен, только в Business-переписках.
+  if (ROMANTIC && ROMANTIC_PROMPT && context.chatKind === "business") {
     parts.push("контекст этого разговора: личное, романтическое общение.\n\n" + ROMANTIC_PROMPT)
   }
 
@@ -465,16 +472,10 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
-  const settings = chatSettings(chatKey)
-
   try {
     const result = await callWithFallback(
       history,
-      systemPromptFor(from, {
-        ...context,
-        chatKind: chatType,
-        romantic: Boolean(settings.romantic),
-      }),
+      systemPromptFor(from, { ...context, chatKind: chatType }),
       hooks,
     )
     addMessage(chatKey, "assistant", result.answer, chatType)
@@ -785,28 +786,14 @@ export function registerCommands(bot) {
     return ctx.reply(`Бот снова включён в чате ${ctx.chat.id}.`)
   })
 
-  // Включить романтический стиль в конкретном чате.
-  bot.command("romantic", (ctx) => {
-    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
-    const arg = ctx.message.text.split(/\s+/)[1]?.toLowerCase()
-    const key = `biz:${ctx.chat.id}`
-    const on = arg !== "off"
-    setChatRomantic(key, on, "business")
-    return ctx.reply(
-      on
-        ? `Романтический стиль включён в чате ${ctx.chat.id}.`
-        : `Романтический стиль выключен в чате ${ctx.chat.id}.`,
-    )
-  })
-
-  // Список чатов с состоянием: где бот включён, где романтический стиль.
+  // Список чатов: где бот включён и сколько сообщений.
   bot.command("chats", (ctx) => {
     if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
     const rows = listChats(30)
     if (!rows.length) return ctx.reply("Пока ни одного чата в базе.")
     const lines = rows.map(
       (row) =>
-        `${row.chat_key} · ${row.enabled ? "вкл" : "ВЫКЛ"}${row.romantic ? " · романтика" : ""} · ${row.messages} сообщ.`,
+        `${row.chat_key} · ${row.enabled ? "вкл" : "ВЫКЛ"} · ${row.messages} сообщ.`,
     )
     return ctx.reply(["Чаты:", "", ...lines].join("\n"))
   })

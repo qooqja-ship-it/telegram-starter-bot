@@ -71,7 +71,6 @@ db.exec(`
     chat_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 1,
     reset_after_id INTEGER NOT NULL DEFAULT 0,
-    romantic INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(chat_id) REFERENCES chats(id)
   );
@@ -153,57 +152,43 @@ export function recentMessages(chatKey, limit = 12) {
 // --- Настройки чата ------------------------------------------------------------
 
 const stmtSettings = db.prepare(
-  "SELECT enabled, reset_after_id, romantic FROM chat_settings WHERE chat_id = ?",
+  "SELECT enabled, reset_after_id FROM chat_settings WHERE chat_id = ?",
 )
 const stmtUpsertSettings = db.prepare(`
-  INSERT INTO chat_settings (chat_id, enabled, reset_after_id, romantic)
-  VALUES (?, ?, ?, ?)
+  INSERT INTO chat_settings (chat_id, enabled, reset_after_id)
+  VALUES (?, ?, ?)
   ON CONFLICT(chat_id) DO UPDATE SET
     enabled = excluded.enabled,
     reset_after_id = excluded.reset_after_id,
-    romantic = excluded.romantic,
     updated_at = CURRENT_TIMESTAMP
 `)
 
 export function chatSettings(chatKey) {
   const chatId = stmtChatId.get(chatKey)?.id
-  if (!chatId) return { enabled: true, reset_after_id: 0, romantic: 0 }
+  if (!chatId) return { enabled: true, reset_after_id: 0 }
 
   return (
-    stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0, romantic: 0 }
+    stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0 }
   )
 }
 
-function saveSettings(chatId, { enabled, reset_after_id, romantic }) {
-  stmtUpsertSettings.run(chatId, enabled ? 1 : 0, reset_after_id, romantic ? 1 : 0)
+function saveSettings(chatId, { enabled, reset_after_id }) {
+  stmtUpsertSettings.run(chatId, enabled ? 1 : 0, reset_after_id)
 }
 
 // Включить или выключить бота в одном чате.
 export function setChatEnabled(chatKey, enabled, chatType = "private") {
   const chatId = ensureChat(chatKey, chatType)
-  const current = stmtSettings.get(chatId) ?? { reset_after_id: 0, romantic: 0 }
+  const current = stmtSettings.get(chatId) ?? { reset_after_id: 0 }
   saveSettings(chatId, {
     enabled,
     reset_after_id: current.reset_after_id,
-    romantic: current.romantic,
   })
   return enabled
 }
 
 export function isChatEnabled(chatKey) {
   return Boolean(chatSettings(chatKey).enabled)
-}
-
-// Включить романтический стиль в конкретном чате.
-export function setChatRomantic(chatKey, romantic, chatType = "private") {
-  const chatId = ensureChat(chatKey, chatType)
-  const current = stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0 }
-  saveSettings(chatId, {
-    enabled: current.enabled,
-    reset_after_id: current.reset_after_id,
-    romantic,
-  })
-  return romantic
 }
 
 // Начать историю заново, не удаляя старые сообщения.
@@ -216,11 +201,10 @@ export function resetChatHistory(chatKey) {
     .prepare("SELECT COALESCE(MAX(id), 0) AS n FROM messages WHERE chat_id = ?")
     .get(chatId).n
 
-  const current = stmtSettings.get(chatId) ?? { enabled: 1, romantic: 0 }
+  const current = stmtSettings.get(chatId) ?? { enabled: 1 }
   saveSettings(chatId, {
     enabled: current.enabled,
     reset_after_id: lastId,
-    romantic: current.romantic,
   })
 
   return { reset: true, kept: lastId }
@@ -257,7 +241,6 @@ export function listChats(limit = 30) {
     .prepare(`
       SELECT c.chat_key,
              COALESCE(s.enabled, 1) AS enabled,
-             COALESCE(s.romantic, 0) AS romantic,
              (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS messages
       FROM chats c
       LEFT JOIN chat_settings s ON s.chat_id = c.id
