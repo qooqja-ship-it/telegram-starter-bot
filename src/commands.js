@@ -204,8 +204,6 @@ function systemPromptFor(from, context = {}) {
   const addressee = addresseeBlock(from, context)
   if (addressee) parts.push(addressee)
 
-  // Романтический стиль включается только для этого чата и только когда
-  // в базе стоит флаг. Остальные переписки он не касается.
   // Романтический стиль: глобальный флаг из переменной окружения.
   // В личке с самим ботом он не нужен, только в Business-переписках.
   if (ROMANTIC && ROMANTIC_PROMPT && context.chatKind === "business") {
@@ -218,26 +216,35 @@ function systemPromptFor(from, context = {}) {
   return parts.join("\n\n")
 }
 
-// Текущее время в Махачкале. Без этого бот говорит «я на работе»
-// и в субботу в полночь.
 // Текущее время в Махачкале и вывод, где владелец находится сейчас.
 // Считаем в коде, а не просим посчитать модель: на этом она уже ошибалась,
 // отвечая «сегодня выходной» в среду днём.
-function nowBlock() {
-  const now = new Date()
+//
+// Форматер создаётся один раз: Intl.DateTimeFormat тяжёлый в создании,
+// а нужен на каждое сообщение.
+const MAKHACHKALA_FMT = new Intl.DateTimeFormat("ru-RU", {
+  timeZone: "Europe/Moscow",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+})
 
-  const fmt = new Intl.DateTimeFormat("ru-RU", {
-    timeZone: "Europe/Moscow",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  })
+const WEEKDAYS = [
+  "воскресенье",
+  "понедельник",
+  "вторник",
+  "среда",
+  "четверг",
+  "пятница",
+  "суббота",
+]
 
+function nowBlock(now = new Date()) {
   const parts = Object.fromEntries(
-    fmt.formatToParts(now).map((part) => [part.type, part.value]),
+    MAKHACHKALA_FMT.formatToParts(now).map((part) => [part.type, part.value]),
   )
 
   const year = Number(parts.year)
@@ -248,15 +255,7 @@ function nowBlock() {
 
   // 0 — воскресенье, 1 — понедельник.
   const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
-  const weekdayName = [
-    "воскресенье",
-    "понедельник",
-    "вторник",
-    "среда",
-    "четверг",
-    "пятница",
-    "суббота",
-  ][weekday]
+  const weekdayName = WEEKDAYS[weekday]
 
   const minutes = hour * 60 + minute
   const isWeekend = weekday === 0 || weekday === 6
@@ -290,6 +289,8 @@ function nowBlock() {
 function normalize(history) {
   // Ограничиваем контекст по количеству и по объёму, идя с конца,
   // чтобы последнее сообщение собеседника не потерялось.
+  // Собираем через push и разворачиваем: unshift в цикле сдвигает
+  // весь массив на каждой итерации.
   const recent = []
   let totalChars = 0
 
@@ -299,9 +300,11 @@ function normalize(history) {
 
     if (recent.length > 0 && totalChars + size > MAX_HISTORY_CHARS) break
 
-    recent.unshift(message)
+    recent.push(message)
     totalChars += size
   }
+
+  recent.reverse()
 
   const out = []
   for (const message of recent) {
@@ -599,12 +602,23 @@ const ALERT_WORDS = [
   "вызов",
 ]
 
+// Одно регулярное выражение вместо 24 вызовов includes на каждое сообщение.
+const ALERT_RE = new RegExp(ALERT_WORDS.join("|"), "i")
+
 const ALERT_COOLDOWN_MS = 10 * 60 * 1000
+const ALERT_MEMORY_MS = 60 * 60 * 1000
 const lastAlertAt = new Map()
 
 function looksImportant(text) {
-  const lower = text.toLowerCase()
-  return ALERT_WORDS.some((word) => lower.includes(word))
+  return ALERT_RE.test(text)
+}
+
+// Map растёт с каждым новым отправителем. Чистим записи старше часа,
+// чтобы за месяцы работы не копились тысячи ключей.
+function pruneAlertMemory(now = Date.now()) {
+  for (const [id, at] of lastAlertAt) {
+    if (now - at > ALERT_MEMORY_MS) lastAlertAt.delete(id)
+  }
 }
 
 async function notifyOwner(api, text, from, chatLabel, originalMessage = null) {
@@ -616,6 +630,9 @@ async function notifyOwner(api, text, from, chatLabel, originalMessage = null) {
   const since = lastAlertAt.get(fromId) || 0
   if (Date.now() - since < ALERT_COOLDOWN_MS) return
   lastAlertAt.set(fromId, Date.now())
+
+  // Чистим редко, чтобы не сканировать Map на каждое сообщение.
+  if (lastAlertAt.size > 500) pruneAlertMemory()
 
   const fullName = [from.first_name, from.last_name].filter(Boolean).join(" ").trim()
   const username = from.username ? `@${from.username}` : null
@@ -736,8 +753,14 @@ export function registerCommands(bot) {
         "/model — показать используемые модели",
         "/status — состояние настроек и памяти",
         "/myid — узнать свой Telegram ID",
-        "/reset — очистить память диалога",
+        "/reset — начать историю чата заново",
         "/stickers — коллекция стикеров",
+        "",
+        "Управление переписками (только владельцу):",
+        "/chats — список чатов с id",
+        "/stop <id> — выключить бота в чате",
+        "/on <id> — включить бота в чате",
+        "Внутри Business-чата можно без id: /stop",
       ].join("\n"),
     ),
   )

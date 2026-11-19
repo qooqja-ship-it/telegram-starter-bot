@@ -117,9 +117,30 @@ const stmtRecentMessages = db.prepare(`
 `)
 const stmtCount = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?")
 
+// Кеш chat_key -> id. На каждое сообщение раньше уходило 4 лишних запроса:
+// INSERT ... ON CONFLICT, затем SELECT того же id, и снова в recentMessages.
+// Ключей в базе десятки, память незаметна.
+const chatIdCache = new Map()
+
+function chatIdOf(chatKey) {
+  const cached = chatIdCache.get(chatKey)
+  if (cached !== undefined) return cached
+
+  const row = stmtChatId.get(chatKey)
+  if (!row) return null
+
+  chatIdCache.set(chatKey, row.id)
+  return row.id
+}
+
 function ensureChat(chatKey, chatType = "private") {
+  const cached = chatIdCache.get(chatKey)
+  if (cached !== undefined) return cached
+
   stmtInsertChat.run(chatKey, chatType)
-  return stmtChatId.get(chatKey).id
+  const id = stmtChatId.get(chatKey).id
+  chatIdCache.set(chatKey, id)
+  return id
 }
 
 export function addMessage(chatKey, senderType, content, chatType = "private", messageType = "text") {
@@ -133,7 +154,7 @@ export function addMessage(chatKey, senderType, content, chatType = "private", m
 // Сообщения до точки сброса не отдаём: история начинается с чистого листа,
 // но старые данные остаются в базе.
 export function recentMessages(chatKey, limit = 12) {
-  const chatId = stmtChatId.get(chatKey)?.id
+  const chatId = chatIdOf(chatKey)
   if (!chatId) return []
 
   const { reset_after_id: afterId } = chatSettings(chatKey)
@@ -164,7 +185,7 @@ const stmtUpsertSettings = db.prepare(`
 `)
 
 function chatSettings(chatKey) {
-  const chatId = stmtChatId.get(chatKey)?.id
+  const chatId = chatIdOf(chatKey)
   if (!chatId) return { enabled: true, reset_after_id: 0 }
 
   return (
@@ -194,7 +215,7 @@ export function isChatEnabled(chatKey) {
 // Начать историю заново, не удаляя старые сообщения.
 // Модель перестаёт их видеть, в базе они остаются.
 export function resetChatHistory(chatKey) {
-  const chatId = stmtChatId.get(chatKey)?.id
+  const chatId = chatIdOf(chatKey)
   if (!chatId) return { reset: false, kept: 0 }
 
   const lastId = db
@@ -211,7 +232,7 @@ export function resetChatHistory(chatKey) {
 }
 
 export function deleteChat(chatKey) {
-  const chatId = stmtChatId.get(chatKey)?.id
+  const chatId = chatIdOf(chatKey)
   if (!chatId) return 0
   const changes = db.transaction(() => {
     db.prepare("DELETE FROM messages WHERE chat_id = ?").run(chatId)
@@ -221,6 +242,8 @@ export function deleteChat(chatKey) {
     db.prepare("DELETE FROM chat_settings WHERE chat_id = ?").run(chatId)
     db.prepare("DELETE FROM chats WHERE id = ?").run(chatId)
   })()
+  // Без этого после удаления кеш вернёт id, которого уже нет.
+  chatIdCache.delete(chatKey)
   return changes
 }
 
@@ -231,7 +254,7 @@ export function stats() {
 }
 
 export function messageCount(chatKey) {
-  const chatId = stmtChatId.get(chatKey)?.id
+  const chatId = chatIdOf(chatKey)
   return chatId ? stmtCount.get(chatId).n : 0
 }
 
