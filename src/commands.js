@@ -147,9 +147,15 @@ function addresseeBlock(from, context = {}) {
   const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ").trim()
   if (name) {
     parts.push(`собеседник: ${name}.`)
-    parts.push("род собеседника не указан. не угадывай пол по имени.")
-    parts.push("если пол не ясен из речи собеседника, пиши нейтрально: без «он», «она», «друг», «красавица»,")
-    parts.push("без обращений в мужском или женском роде.")
+    if (context.chatKind === "business") {
+      parts.push("пол собеседника не указан явно. определяй его по речи и по ходу разговора,")
+      parts.push("и обращайся так, как он сам о себе говорит. пока неясно - пиши нейтрально,")
+      parts.push("без «он», «она», «друг», «красавица» и без обращений в мужском или женском роде.")
+    } else {
+      parts.push("род собеседника не указан. не угадывай пол по имени.")
+      parts.push("если пол не ясен из речи собеседника, пиши нейтрально: без «он», «она», «друг», «красавица»,")
+      parts.push("без обращений в мужском или женском роде.")
+    }
   }
 
   if (name) parts.push(`обращайся к нему по имени, если это уместно: ${name.split(" ")[0]}.`)
@@ -216,8 +222,8 @@ function systemPromptFor(from, context = {}) {
     const stage = Number(context.stage) || 0
     if (stage > 0) {
       parts.push(
-        `сейчас разговор на этапе ${stage}. держись этого этапа, даже если ` +
-          `история выглядит иначе. смена этапа - только через разметку в конце ответа.`,
+        `сейчас разговор на этапе ${stage}. это твоя опора, но если история ` +
+          `говорит иначе - двигайся по истории и поставь новую метку в конце ответа.`,
       )
     }
   }
@@ -931,6 +937,10 @@ export function registerCommands(bot) {
       return
     }
 
+    // Объявлено до try: finally обращается к нему, а внутри блока
+    // переменная для finally не видна. null значит "уведомление не нужно".
+    let alerting = null
+
     try {
       const connection = await ctx.getBusinessConnection()
       if (!connection?.is_enabled) return
@@ -940,9 +950,6 @@ export function registerCommands(bot) {
       // Запоминаем этап до ответа: по разнице поймём, что бот предложил
       // встречу именно сейчас, и один раз сообщим владельцу.
       const stageBefore = getStage(chatKey)
-
-      // Объявлено до try, иначе finally его не видит.
-      let alerting = null
 
       // Бот мог быть выключен в этом чате вручную. Тогда молчим, но
       // сообщения всё равно записываем, чтобы история не терялась.
@@ -1026,7 +1033,7 @@ export function registerCommands(bot) {
     } finally {
       // Уведомление дожидается в любом случае: если модель упала,
       // владелец всё равно должен узнать о важном сообщении.
-      if (alerting) await alerting.catch(() => {})
+      if (alerting) await Promise.resolve(alerting).catch(() => {})
     }
   })
 }
