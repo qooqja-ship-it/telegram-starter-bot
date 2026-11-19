@@ -7,6 +7,8 @@ import {
   addMessage,
   deleteChat,
   isChatEnabled,
+  getStage,
+  setStage,
   listChats,
   messageCount,
   recentMessages,
@@ -32,11 +34,14 @@ const THIRD_MODEL = (process.env.LAREPER_THIRD_MODEL || "").trim()
 // чтобы не тратить время на запрос к той же модели дважды.
 const MODELS = [...new Set([PRIMARY_MODEL, FALLBACK_MODEL, THIRD_MODEL].filter(Boolean))]
 
-// Лимит токенов: reasoning-модели тратят заметную часть бюджета на
-// размышление. При слишком маленьком значении content остаётся пустым,
-// а reasoning_tokens съедает весь ответ.
+// Сколько сообщений и символов истории отдавать модели.
 const MAX_HISTORY = 12
 const MAX_HISTORY_CHARS = 9_000
+
+// Лимит токенов на ответ. Ответы уходят в мессенджер, а не в отчёт:
+// одного-двух предложений достаточно. Большой лимит только замедляет
+// генерацию и даёт модели повод растечься.
+const MAX_TOKENS = Number(process.env.MAX_TOKENS) || 200
 
 // Сколько ждать одну модель и сколько — все попытки вместе.
 // Бюджет должен вмещать хотя бы по одной попытке на каждую модель,
@@ -47,7 +52,6 @@ const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 90_000
 // Повтор той же модели имеет смысл, только если на него остаётся время
 // и ещё остаётся чем ответить, если повтор тоже не пройдёт.
 const MIN_TIME_AFTER_RETRY_MS = 25_000
-const MAX_TOKENS = 600
 
 // Пытаемся отключить у модели пошаговое размышление. Прокси, который не
 // понимает поле, просто его проигнорирует.
@@ -208,6 +212,14 @@ function systemPromptFor(from, context = {}) {
   // В личке с самим ботом он не нужен, только в Business-переписках.
   if (ROMANTIC && ROMANTIC_PROMPT && context.chatKind === "business") {
     parts.push("контекст этого разговора: личное, романтическое общение.\n\n" + ROMANTIC_PROMPT)
+
+    const stage = Number(context.stage) || 0
+    if (stage > 0) {
+      parts.push(
+        `сейчас разговор на этапе ${stage}. держись этого этапа, даже если ` +
+          `история выглядит иначе. смена этапа - только через разметку в конце ответа.`,
+      )
+    }
   }
 
   const now = nowBlock()
@@ -319,8 +331,8 @@ function normalize(history) {
   return out
 }
 
-// Потоковый запрос: onDelta вызывается по мере поступления текста,
-// onFirstToken — когда пришёл первый символ.
+// Запрос к модели. Стриминг используется, чтобы узнать, когда пришёл
+// первый токен, но текст в чат не отдаём: собираем ответ целиком.
 async function callModel(model, history, systemPrompt = SYSTEM_PROMPT, hooks = {}) {
   if (!API_KEY) {
     throw new Error("LAREPER_API_KEY не задан в переменных окружения FadeHost.")
@@ -348,12 +360,11 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT, hooks = {
       },
       reasoningEffort: REASONING_EFFORT,
       signal: controller.signal,
-      onDelta: async (chunk, full) => {
+      onDelta: async () => {
         if (!firstTokenAt) {
           firstTokenAt = Date.now()
           await hooks.onFirstToken?.(Date.now() - startedAt)
         }
-        await hooks.onDelta?.(chunk, full)
       },
     })
 
@@ -397,16 +408,11 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
     // Одна попытка и, если был таймаут, ещё одна: прокси иногда отвечает
     // со второго раза.
     let retried = false
-    let started = false
 
-    // Если модель начала отвечать и упала на середине, черновик уже
-    // показан собеседнику. Перед следующей моделью его надо сбросить.
     const modelHooks = {
       onFirstToken: async (ms) => {
-        started = true
         await hooks.onFirstToken?.(ms)
       },
-      onDelta: hooks.onDelta,
     }
     for (;;) {
       // Перед каждой попыткой считаем остаток бюджета и не даём модели
@@ -445,8 +451,6 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
           error.message,
         )
 
-        if (started) await hooks.onReset?.()
-        started = false
 
         if (canRetry) {
           retried = true
@@ -467,6 +471,25 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
   return fail()
 }
 
+// Служебная разметка [[stage:N]] в ответе модели. Собеседнице она уходить
+// не должна: вырезаем её и запоминаем этап.
+const STAGE_RE = /\[\[\s*stage\s*:\s*(\d)\s*\]\]/gi
+
+function extractStage(text) {
+  let stage = null
+
+  const cleaned = String(text)
+    .replace(STAGE_RE, (_match, value) => {
+      const parsed = Number(value)
+      if (parsed >= 1 && parsed <= 3) stage = parsed
+      return ""
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+
+  return { text: cleaned, stage }
+}
+
 // Общая функция для личных и Business-чатов. Сообщение собеседника уже
 // записано в базу до вызова — здесь только контекст и ответ.
 // send — функция отправки/редактирования, чтобы текст появлялся по мере
@@ -475,100 +498,27 @@ async function askAI(chatKey, userText, chatType = "private", from = null, hooks
   addMessage(chatKey, "user", userText, chatType)
   const history = recentMessages(chatKey, MAX_HISTORY)
 
+  const stage = getStage(chatKey)
+
   const result = await callWithFallback(
     history,
-    systemPromptFor(from, { ...context, chatKind: chatType }),
+    systemPromptFor(from, { ...context, chatKind: chatType, stage }),
     hooks,
   )
-  addMessage(chatKey, "assistant", result.answer, chatType)
-  return result.answer
-}
 
-// --- Живой набор в Telegram --------------------------------------------------
-// Ответ модели приходит кусками. Показываем его одним сообщением, которое
-// правим по мере поступления текста. Так собеседник видит ответ через
-// секунду, а не через тридцать.
+  const final = extractStage(result.answer)
 
-const DRAFT_UPDATE_MS = 900
-
-// Telegram сбрасывает «печатает» через 5 секунд, а ответ модели идёт
-// дольше. Продлеваем, пока ждём. Возвращает функцию остановки.
-function keepTyping(sendAction, intervalMs = 4000) {
-  sendAction()
-  const timer = setInterval(() => sendAction(), intervalMs)
-  timer.unref?.()
-  return () => clearInterval(timer)
-}
-
-function createDraft({ send, edit }) {
-  let messageId = null
-  let lastSent = ""
-  let lastAt = 0
-  let sendFailed = false
-
-  async function flush(full, force = false) {
-    if (!full || sendFailed) return
-    const now = Date.now()
-    if (!force && now - lastAt < DRAFT_UPDATE_MS) return
-    if (full === lastSent) return
-
-    lastAt = now
-    lastSent = full
-
-    try {
-      if (messageId === null) {
-        messageId = await send(full)
-      } else {
-        await edit(messageId, full)
-      }
-    } catch (error) {
-      // Правка может не пройти, если текст не изменился или Telegram
-      // ругается на частоту. Это не повод ломать ответ.
-      if (/message is not modified/i.test(error.message)) return
-
-      console.error("[draft] не удалось обновить сообщение:", error.message)
-
-      // Первая отправка не прошла — дальше править нечего. Запоминаем,
-      // чтобы весь остаток ответа отправить одним сообщением в конце.
-      if (messageId === null) sendFailed = true
-    }
+  // Этап сохраняем, чтобы сохранить преемственность между сообщениями:
+  // модель может ошибиться на одном ответе, но не должна прыгать туда-сюда.
+  if (final.stage !== null && final.stage !== stage) {
+    setStage(chatKey, final.stage, chatType)
+    console.log(`[stage] ${chatKey}: ${stage} -> ${final.stage}`)
   }
 
-  return {
-    onFirstToken: () => {},
-    onDelta: async (_chunk, full) => {
-      await flush(full)
-    },
-    // Модель упала после начала ответа: убираем черновик, чтобы
-    // собеседник не видел обрывок.
-    onReset: async () => {
-      if (messageId !== null && lastSent) {
-        await edit(messageId, "…").catch(() => {})
-      }
-      messageId = null
-      lastSent = ""
-      sendFailed = false
-    },
-    // Возвращает true, если ответ дошёл до собеседника.
-    async finish(full) {
-      if (!full) return false
-
-      if (sendFailed) {
-        // Стриминг не сработал — отправляем целиком.
-        try {
-          await send(full)
-          return true
-        } catch (error) {
-          console.error("[draft] не удалось отправить ответ:", error.message)
-          return false
-        }
-      }
-
-      await flush(full, true)
-      return messageId !== null
-    },
-  }
+  addMessage(chatKey, "assistant", final.text, chatType)
+  return final.text
 }
+
 
 // --- Уведомления владельцу ---------------------------------------------------
 // Срабатывают по ключевым словам, а не по просьбе модели: если модель забудет
@@ -917,22 +867,16 @@ export function registerCommands(bot) {
             })()
           : null
 
-      const draft = createDraft({
-        send: async (text) => {
-          const sent = await ctx.reply(text)
-          return sent.message_id
-        },
-        edit: (id, text) => ctx.api.editMessageText(ctx.chat.id, id, text),
-      })
-
       let answer
       try {
-        answer = await askAI(chatKey, userText, "private", ctx.from, draft)
+        answer = await askAI(chatKey, userText, "private", ctx.from)
       } finally {
         stopTyping()
       }
 
-      await draft.finish(answer)
+      // Отправляем готовый текст один раз: собеседник не должен видеть,
+      // как сообщение правится.
+      if (answer) await ctx.reply(answer)
       if (alerting) await alerting
     } catch (error) {
       console.error("[Lareper error]", error.message)
@@ -975,6 +919,10 @@ export function registerCommands(bot) {
       if (!connection?.is_enabled) return
 
       const chatKey = `biz:${ctx.chat.id}`
+
+      // Запоминаем этап до ответа: по разнице поймём, что бот предложил
+      // встречу именно сейчас, и один раз сообщим владельцу.
+      const stageBefore = getStage(chatKey)
 
       // Бот мог быть выключен в этом чате вручную. Тогда молчим, но
       // сообщения всё равно записываем, чтобы история не терялась.
@@ -1021,28 +969,34 @@ export function registerCommands(bot) {
         ctx.api.sendChatAction(ctx.chat.id, "typing", { business_connection_id: connectionId }).catch(() => {}),
       )
 
-      const draft = createDraft({
-        send: async (text) => {
-          const sent = await ctx.api.sendMessage(ctx.chat.id, text, {
-            business_connection_id: connectionId,
-          })
-          return sent.message_id
-        },
-        edit: (id, text) =>
-          ctx.api.editMessageText(ctx.chat.id, id, text, {
-            business_connection_id: connectionId,
-          }),
-      })
-
       let answer
       try {
-        answer = await askAI(chatKey, userText, "business", ctx.from, draft)
+        answer = await askAI(chatKey, userText, "business", ctx.from)
       } finally {
         stopTyping()
       }
 
-      // Ответ показываем первым, уведомление догоняет.
-      await draft.finish(answer)
+      // Один готовый текст, без правок на глазах у собеседника.
+      if (answer) {
+        await ctx.api.sendMessage(ctx.chat.id, answer, {
+          business_connection_id: connectionId,
+        })
+      }
+
+      // Если бот только что предложил встречу, сообщаем владельцу,
+      // чтобы он знал, о чём договорились.
+      if (stageBefore !== 3 && getStage(chatKey) === 3 && answer) {
+        await notifyOwner(
+          ctx.api,
+          `бот предложил встречу в этом чате:\n\n${answer}\n\n` +
+            `следи за ответом. если откажет, бот не должен возвращаться к теме`,
+          ctx.from,
+          `предложение встречи, chat ${ctx.chat.id}`,
+          null,
+        ).catch((error) =>
+          console.error("[alert] не удалось сообщить о предложении:", error.message),
+        )
+      }
     } catch (error) {
       // В чужой переписке технические ошибки не отправляем.
       console.error(

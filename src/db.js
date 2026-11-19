@@ -67,10 +67,13 @@ db.exec(`
 
   -- Настройки на каждый чат: включён ли бот, с какого сообщения
   -- считать историю. enabled=0 — бот в этом чате молчит.
+  -- stage: 0 — обычное общение, 1–3 — этапы знакомства в личных чатах.
   CREATE TABLE IF NOT EXISTS chat_settings (
     chat_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 1,
     reset_after_id INTEGER NOT NULL DEFAULT 0,
+    stage INTEGER NOT NULL DEFAULT 0,
+    stage_changed_at TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(chat_id) REFERENCES chats(id)
   );
@@ -98,6 +101,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_memories_chat ON memories(chat_id);
   CREATE INDEX IF NOT EXISTS idx_summaries_chat ON summaries(chat_id);
 `)
+
+// --- Миграции схемы ------------------------------------------------------------
+// CREATE TABLE IF NOT EXISTS не добавляет новые колонки в уже существующую
+// таблицу, поэтому колонки, появившиеся позже, добавляем вручную.
+
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all()
+  if (columns.some((c) => c.name === column)) return
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+  console.log(`[SQLite] добавлена колонка ${table}.${column}`)
+}
+
+ensureColumn("chat_settings", "stage", "INTEGER NOT NULL DEFAULT 0")
+ensureColumn("chat_settings", "stage_changed_at", "TEXT")
 
 // --- Запросы -----------------------------------------------------------------
 
@@ -173,43 +190,70 @@ export function recentMessages(chatKey, limit = 12) {
 // --- Настройки чата ------------------------------------------------------------
 
 const stmtSettings = db.prepare(
-  "SELECT enabled, reset_after_id FROM chat_settings WHERE chat_id = ?",
+  "SELECT enabled, reset_after_id, stage FROM chat_settings WHERE chat_id = ?",
 )
 const stmtUpsertSettings = db.prepare(`
-  INSERT INTO chat_settings (chat_id, enabled, reset_after_id)
-  VALUES (?, ?, ?)
+  INSERT INTO chat_settings (chat_id, enabled, reset_after_id, stage)
+  VALUES (?, ?, ?, ?)
   ON CONFLICT(chat_id) DO UPDATE SET
     enabled = excluded.enabled,
     reset_after_id = excluded.reset_after_id,
+    stage = excluded.stage,
     updated_at = CURRENT_TIMESTAMP
 `)
 
 function chatSettings(chatKey) {
   const chatId = chatIdOf(chatKey)
-  if (!chatId) return { enabled: true, reset_after_id: 0 }
+  if (!chatId) return { enabled: true, reset_after_id: 0, stage: 0 }
 
-  return (
-    stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0 }
-  )
+  return stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0, stage: 0 }
 }
 
-function saveSettings(chatId, { enabled, reset_after_id }) {
-  stmtUpsertSettings.run(chatId, enabled ? 1 : 0, reset_after_id)
+function saveSettings(chatId, { enabled, reset_after_id, stage }) {
+  stmtUpsertSettings.run(chatId, enabled ? 1 : 0, reset_after_id, stage)
 }
 
 // Включить или выключить бота в одном чате.
 export function setChatEnabled(chatKey, enabled, chatType = "private") {
   const chatId = ensureChat(chatKey, chatType)
-  const current = stmtSettings.get(chatId) ?? { reset_after_id: 0 }
+  const current = stmtSettings.get(chatId) ?? { reset_after_id: 0, stage: 0 }
   saveSettings(chatId, {
     enabled,
     reset_after_id: current.reset_after_id,
+    stage: current.stage,
   })
   return enabled
 }
 
 export function isChatEnabled(chatKey) {
   return Boolean(chatSettings(chatKey).enabled)
+}
+
+// Этап знакомства: 0 — обычное общение, 1 — лёгкий флирт,
+// 2 — явный флирт с интригой, 3 — предложение встречи.
+// Значение подсказывает модель, но в базу пишется текущее, чтобы
+// бот не прыгал между этапами на каждом сообщении.
+export function getStage(chatKey) {
+  return Number(chatSettings(chatKey).stage) || 0
+}
+
+export function setStage(chatKey, stage, chatType = "private") {
+  const chatId = ensureChat(chatKey, chatType)
+  const current = stmtSettings.get(chatId) ?? { enabled: 1, reset_after_id: 0, stage: 0 }
+
+  saveSettings(chatId, {
+    enabled: current.enabled,
+    reset_after_id: current.reset_after_id,
+    stage,
+  })
+
+  if (stage > 0) {
+    db.prepare(
+      "UPDATE chat_settings SET stage_changed_at = CURRENT_TIMESTAMP WHERE chat_id = ?",
+    ).run(chatId)
+  }
+
+  return stage
 }
 
 // Начать историю заново, не удаляя старые сообщения.
@@ -222,10 +266,11 @@ export function resetChatHistory(chatKey) {
     .prepare("SELECT COALESCE(MAX(id), 0) AS n FROM messages WHERE chat_id = ?")
     .get(chatId).n
 
-  const current = stmtSettings.get(chatId) ?? { enabled: 1 }
+  const current = stmtSettings.get(chatId) ?? { enabled: 1, stage: 0 }
   saveSettings(chatId, {
     enabled: current.enabled,
     reset_after_id: lastId,
+    stage: current.stage,
   })
 
   return { reset: true, kept: lastId }
