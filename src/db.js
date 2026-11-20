@@ -322,24 +322,28 @@ export function listChats(limit = 30) {
 
 // --- Молчащие чаты -------------------------------------------------------------
 // Нужны, чтобы бот сам возобновлял разговор после долгой паузы.
-// Берём только те чаты, где бот включён и где переписка уже дошла
-// до личного этапа: в рабочем чате инициатива неуместна.
+// Берём личные Business-чаты, где бот не выключен вручную. Этап не обязателен:
+// в старых переписках его может не быть вовсе, и это не повод бросать чат.
+//
+// LEFT JOIN, а не JOIN: у чатов, заведённых до появления настроек,
+// строки в chat_settings нет. С обычным JOIN они бы выпадали из выборки.
 
 const stmtQuietChats = db.prepare(`
   SELECT c.chat_key,
          c.chat_type,
-         s.stage,
+         COALESCE(s.stage, 0) AS stage,
+         COALESCE(s.enabled, 1) AS enabled,
          m.sender_type AS last_sender,
          m.created_at  AS last_at
   FROM chats c
-  JOIN chat_settings s ON s.chat_id = c.id
+  LEFT JOIN chat_settings s ON s.chat_id = c.id
   JOIN messages m ON m.id = (
     SELECT MAX(id) FROM messages WHERE chat_id = c.id
   )
   WHERE c.chat_type = 'business'
-    AND s.enabled = 1
-    AND s.stage > 0
-    AND m.id > s.reset_after_id
+    AND COALESCE(s.enabled, 1) = 1
+    AND m.id > COALESCE(s.reset_after_id, 0)
+    AND COALESCE(s.stage, 0) < 4
   ORDER BY m.created_at ASC
 `)
 

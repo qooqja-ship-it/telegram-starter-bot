@@ -159,6 +159,12 @@ function addresseeBlock(from, context = {}) {
   parts.push("скобки вида он(-а), она(-а), (а) и он/она не пиши никогда.")
   parts.push("имя не подставляй и с имени сообщение не начинай.")
 
+  // Отдельно: в Business-чатах пол по умолчанию считается неизвестным,
+  // поэтому нейтральная формулировка предпочтительнее.
+  if (context.chatKind === "business") {
+    parts.push("если из речи пол не виден явно, выбирай нейтральную формулировку, а не догадку.")
+  }
+
   const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ").trim()
   if (name) {
     parts.push(`в профиле указано: ${name}. это может быть ник, а не настоящее имя,`)
@@ -692,9 +698,12 @@ function saveStickersSoon() {
 // выглядела бы странно.
 //
 // Порог в часах. Ставится переменной NUDGE_AFTER_HOURS, 0 отключает заходы.
-const NUDGE_AFTER_HOURS = Number(process.env.NUDGE_AFTER_HOURS ?? 20)
-// Даже если проигнорировали, чаще раза в сутки бот не пишет.
-const NUDGE_COOLDOWN_HOURS = 24
+// 12 часов: пауза через день считается затянувшейся, но заход не выглядит
+// как погоня. Меньше десяти часов не стоит: это уже давление.
+const NUDGE_AFTER_HOURS = Number(process.env.NUDGE_AFTER_HOURS ?? 12)
+// После неудачного захода ждём дольше: если человек не ответил на первое
+// сообщение, второе через сутки будет навязчивым. Поэтому 48 часов.
+const NUDGE_COOLDOWN_HOURS = Number(process.env.NUDGE_COOLDOWN_HOURS ?? 48)
 // Не больше одного захода за один проход планировщика, чтобы пачка
 // сообщений не улетела людям одновременно.
 const NUDGE_PER_TICK = 1
@@ -792,30 +801,60 @@ async function businessConnectionIdFor(api, chatId) {
 
 async function nudgeLoop(api) {
   if (!(NUDGE_AFTER_HOURS > 0)) return
-  if (isQuietTime()) return
+  if (isQuietTime()) {
+    console.log("[nudge] тихое время, проход пропущен")
+    return
+  }
+
+  const chats = quietChats()
+  const considered = []
 
   let sent = 0
-  for (const chat of quietChats()) {
+  for (const chat of chats) {
     if (sent >= NUDGE_PER_TICK) break
-
-    // Инициатива уместна только если последним писал собеседник.
-    // Если последняя реплика наша, ждём её, а не догоняем.
-    if (chat.last_sender !== "user") continue
 
     const chatKey = chat.chat_key
     const silentHours = hoursSince(chat.last_at)
-    if (silentHours < NUDGE_AFTER_HOURS) continue
 
-    if (hoursSince(nudgeAt(chatKey)) < NUDGE_COOLDOWN_HOURS) continue
+    // Причина отказа видна в логе: иначе непонятно, почему бот молчит.
+    const skip = (why) => considered.push(`${chatKey}: ${why}`)
+
+    if (chat.last_sender !== "user") {
+      skip(`последним писал ${chat.last_sender}, ждём собеседника`)
+      continue
+    }
+
+    if (silentHours < NUDGE_AFTER_HOURS) {
+      skip(`пауза ${silentHours.toFixed(1)} ч, порог ${NUDGE_AFTER_HOURS} ч`)
+      continue
+    }
+
+    if (hoursSince(nudgeAt(chatKey)) < NUDGE_COOLDOWN_HOURS) {
+      skip("недавно уже заходил")
+      continue
+    }
 
     const chatId = chatIdFromKey(chatKey)
-    if (!chatId) continue
+    if (!chatId) {
+      skip("не разобрал id чата")
+      continue
+    }
 
-    // Если в чате уже есть наша реплика после её последнего сообщения,
-    // догонять не нужно.
-    if (hoursSince(lastBotMessageAt(chatKey)) < silentHours) continue
+    // Бывает, что последняя реплика формально её, но бот на неё уже
+    // отвечал и сообщение не дошло. Тогда повторно не догоняем.
+    const lastBot = hoursSince(lastBotMessageAt(chatKey))
+    if (lastBot < silentHours) {
+      skip(`бот уже писал позже (${lastBot.toFixed(1)} ч назад)`)
+      continue
+    }
 
+    considered.push(`${chatKey}: кандидат, пауза ${silentHours.toFixed(1)} ч`)
     if (await runNudge(api, chatKey, chatId, chat.stage)) sent += 1
+  }
+
+  // Пишем коротко: только проблемные чаты, и не чаще чем раз в проход.
+  if (!sent && considered.length) {
+    console.log("[nudge] некому писать:", considered.join("; "))
   }
 }
 
@@ -828,7 +867,9 @@ function startNudgeLoop(api) {
     return
   }
 
-  console.log(`[nudge] включены: пауза от ${NUDGE_AFTER_HOURS} ч, не чаще раза в сутки`)
+  console.log(
+    `[nudge] включены: пауза от ${NUDGE_AFTER_HOURS} ч, повтор не чаще раза в ${NUDGE_COOLDOWN_HOURS} ч`,
+  )
   const timer = setInterval(() => {
     nudgeLoop(api).catch((error) => console.error("[nudge] проход упал:", error.message))
   }, NUDGE_TICK_MS)
