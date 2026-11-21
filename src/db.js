@@ -117,6 +117,8 @@ ensureColumn("chat_settings", "stage", "INTEGER NOT NULL DEFAULT 0")
 ensureColumn("chat_settings", "stage_changed_at", "TEXT")
 // Когда бот последний раз сам начинал разговор после паузы.
 ensureColumn("chat_settings", "nudge_at", "TEXT")
+ensureColumn("chats", "business_connection_id", "TEXT")
+ensureColumn("chats", "business_incoming_at", "INTEGER")
 
 // --- Запросы -----------------------------------------------------------------
 
@@ -166,6 +168,22 @@ export function addMessage(chatKey, senderType, content, chatType = "private", m
   const chatId = ensureChat(chatKey, chatType)
   stmtInsertMessage.run(chatId, senderType, messageType, content)
   return chatId
+}
+
+export function rememberBusinessIncoming(chatKey, connectionId, timestamp) {
+  const id = ensureChat(chatKey, "business")
+  db.prepare(`
+    UPDATE chats SET business_connection_id = ?, business_incoming_at = ?
+    WHERE id = ? AND (business_incoming_at IS NULL OR business_incoming_at <= ?)
+  `).run(connectionId, timestamp, id, timestamp)
+}
+
+export function lastMessageId(chatKey) {
+  const id = chatIdOf(chatKey)
+  if (!id) return 0
+  const { reset_after_id: afterId } = chatSettings(chatKey)
+  return db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM messages WHERE chat_id = ? AND id > ?")
+    .get(id, afterId).id
 }
 
 // Возвращает последние сообщения в хронологическом порядке.
@@ -232,7 +250,7 @@ export function isChatEnabled(chatKey) {
 }
 
 // Этап знакомства: 0 — обычное общение, 1 — лёгкий флирт,
-// 2 — явный флирт с интригой, 3 — предложение встречи.
+// 2 — взаимный флирт, 3 — приглашение отправлено, 4 — от встречи отказались.
 // Значение подсказывает модель, но в базу пишется текущее, чтобы
 // бот не прыгал между этапами на каждом сообщении.
 export function getStage(chatKey) {
@@ -322,28 +340,32 @@ export function listChats(limit = 30) {
 
 // --- Молчащие чаты -------------------------------------------------------------
 // Нужны, чтобы бот сам возобновлял разговор после долгой паузы.
-// Берём личные Business-чаты, где бот не выключен вручную. Этап не обязателен:
-// в старых переписках его может не быть вовсе, и это не повод бросать чат.
-//
-// LEFT JOIN, а не JOIN: у чатов, заведённых до появления настроек,
-// строки в chat_settings нет. С обычным JOIN они бы выпадали из выборки.
+// Берём включённые Business-чаты на этапе взаимного флирта.
 
 const stmtQuietChats = db.prepare(`
   SELECT c.chat_key,
-         c.chat_type,
-         COALESCE(s.stage, 0) AS stage,
-         COALESCE(s.enabled, 1) AS enabled,
-         m.sender_type AS last_sender,
+         c.business_connection_id,
+         c.business_incoming_at,
+         m.id AS last_id,
          m.created_at  AS last_at
   FROM chats c
-  LEFT JOIN chat_settings s ON s.chat_id = c.id
+  JOIN chat_settings s ON s.chat_id = c.id
   JOIN messages m ON m.id = (
     SELECT MAX(id) FROM messages WHERE chat_id = c.id
   )
   WHERE c.chat_type = 'business'
-    AND COALESCE(s.enabled, 1) = 1
-    AND m.id > COALESCE(s.reset_after_id, 0)
-    AND COALESCE(s.stage, 0) < 4
+    AND s.enabled = 1
+    AND m.id > s.reset_after_id
+    AND s.stage = 2
+    AND c.business_connection_id IS NOT NULL
+    AND m.sender_type IN ('owner', 'assistant')
+    AND m.message_type <> 'nudge'
+    AND NOT EXISTS (
+      SELECT 1 FROM messages n
+      WHERE n.chat_id = c.id AND n.message_type = 'nudge' AND n.id > COALESCE((
+        SELECT MAX(id) FROM messages u WHERE u.chat_id = c.id AND u.sender_type = 'user'
+      ), 0)
+    )
   ORDER BY m.created_at ASC
 `)
 
@@ -356,23 +378,6 @@ export function quietChats() {
 export function chatIdFromKey(chatKey) {
   const match = /^biz:(\d+)$/.exec(chatKey)
   return match ? Number(match[1]) : null
-}
-
-// Когда бот последний раз писал в этот чат. Нужно как защита от повторов:
-// даже если собеседник молчит, докучать ему раз в сутки нельзя.
-export function lastBotMessageAt(chatKey) {
-  const chatId = chatIdOf(chatKey)
-  if (!chatId) return null
-
-  const row = db
-    .prepare(`
-      SELECT created_at FROM messages
-      WHERE chat_id = ? AND sender_type = 'assistant'
-      ORDER BY id DESC LIMIT 1
-    `)
-    .get(chatId)
-
-  return row?.created_at ?? null
 }
 
 // Отметка «бот сам написал в этот чат», чтобы не писать дважды.

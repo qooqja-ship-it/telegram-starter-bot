@@ -20,11 +20,12 @@ function parseSseChunk(buffer) {
   let rest = buffer
 
   for (;;) {
-    const split = rest.indexOf("\n\n")
-    if (split === -1) break
+    const separator = /\r?\n\r?\n/.exec(rest)
+    if (!separator) break
+    const split = separator.index
 
     const block = rest.slice(0, split)
-    rest = rest.slice(split + 2)
+    rest = rest.slice(split + separator[0].length)
 
     for (const line of block.split("\n")) {
       if (!line.startsWith("data:")) continue
@@ -100,5 +101,10 @@ export async function streamModel({
     }
   }
 
+  const tail = parseSseChunk(buffer + decoder.decode() + "\n\n")
+  for (const chunk of tail.events) {
+    answer += chunk
+    await onDelta?.(chunk, answer)
+  }
   return answer.trim()
 }
