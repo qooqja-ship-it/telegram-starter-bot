@@ -1,20 +1,19 @@
 // Запросы к Lareper API.
 //
-// Есть два режима: обычный (ждём весь ответ) и потоковый (получаем текст
-// по кускам). Потоковый нужен потому, что прокси иногда отвечает 20-30
-// секунд, а собеседник всё это время видит пустоту.
+// Собираем ответ из потока и измеряем время до первого фрагмента текста.
 //
 // Разбор SSE сделан вручную: формат простой, лишняя зависимость не нужна.
 
 class AiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, finishReason) {
     super(message)
     this.name = "AiError"
     this.status = status
+    this.finishReason = finishReason
   }
 }
 
-// Разбирает поток `data: {...}` построчно. Возвращает куски текста.
+// Разбирает события `data: {...}` и сохраняет причину завершения ответа.
 function parseSseChunk(buffer) {
   const events = []
   let rest = buffer
@@ -34,9 +33,8 @@ function parseSseChunk(buffer) {
 
       try {
         const json = JSON.parse(payload)
-        const delta = json?.choices?.[0]?.delta
-        const text = delta?.content
-        if (typeof text === "string" && text) events.push(text)
+        const choice = json?.choices?.[0]
+        if (choice) events.push(choice)
       } catch {
         // Некорректный кусок пропускаем: один битый пакет не должен
         // ронять весь ответ.
@@ -87,24 +85,34 @@ export async function streamModel({
   let buffer = ""
   let answer = ""
 
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const { events, rest } = parseSseChunk(buffer)
-    buffer = rest
-
-    for (const chunk of events) {
+  async function append(events) {
+    for (const choice of events) {
+      if (["length", "content_filter"].includes(choice.finish_reason)) {
+        throw new AiError(`${model}: API не завершил ответ (${choice.finish_reason}).`, undefined, choice.finish_reason)
+      }
+      const chunk = choice.delta?.content
+      if (typeof chunk !== "string" || !chunk) continue
       answer += chunk
       await onDelta?.(chunk, answer)
     }
   }
 
-  const tail = parseSseChunk(buffer + decoder.decode() + "\n\n")
-  for (const chunk of tail.events) {
-    answer += chunk
-    await onDelta?.(chunk, answer)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const { events, rest } = parseSseChunk(buffer)
+      buffer = rest
+
+      await append(events)
+    }
+
+    const tail = parseSseChunk(buffer + decoder.decode() + "\n\n")
+    await append(tail.events)
+    return answer.trim()
+  } finally {
+    await reader.cancel().catch(() => {})
   }
-  return answer.trim()
 }
