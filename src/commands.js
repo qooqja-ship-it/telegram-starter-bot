@@ -14,13 +14,14 @@ import {
   listChats,
   markNudge,
   messageCount,
-  nudgeAt,
+  nudgeChatState,
   quietChats,
   recentMessages,
   rememberBusinessIncoming,
   resetChatHistory,
   setChatEnabled,
   stats,
+  unansweredBotReplies,
 } from "./db.js"
 
 // --- Lareper API -------------------------------------------------------------
@@ -436,11 +437,12 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
       }
       if (modelRemaining <= 0) break
       try {
-        const answer = await callModel(model, messages, systemPrompt, {
+        const rawAnswer = await callModel(model, messages, systemPrompt, {
           ...hooks,
           maxTokens,
           timeoutMs: Math.min(totalRemaining, modelRemaining),
         })
+        const answer = rawAnswer.replace(/[–—]/g, "-")
         if (hooks.validate && !hooks.validate(answer)) {
           throw new Error("модель вернула черновик или нарушила формат ответа")
         }
@@ -713,8 +715,43 @@ function isQuietTime() {
   return hour >= 23 || hour < 9
 }
 
-function withinReplyWindow(incomingAt) {
-  return Date.now() < incomingAt * 1000 + REPLY_WINDOW_MS
+function withinReplyWindow(incomingAt, at = Date.now()) {
+  return at < incomingAt * 1000 + REPLY_WINDOW_MS
+}
+
+function nudgeDisabledReason() {
+  if (!ROMANTIC) return "Романтический режим выключен. Нужен ROMANTIC=1."
+  if (!ROMANTIC_PROMPT || !REENGAGE_PROMPT) return "Один из файлов промпта отсутствует или пуст."
+  if (!(NUDGE_AFTER_HOURS > 0 && NUDGE_AFTER_HOURS < 24)) {
+    return "NUDGE_AFTER_HOURS должен быть больше нуля и меньше 24."
+  }
+  return null
+}
+
+function nudgeWaitReason(chat) {
+  if (!chat.enabled) return "Автоответы в этом чате выключены."
+  if (chat.stage === 4) return "Встречу уже отклонили."
+  if (![2, 3].includes(chat.stage)) return "Взаимный флирт или приглашение ещё не зарегистрированы."
+  if (!chat.business_connection_id || !chat.business_incoming_at) return "Нет сохранённого входящего Business-сообщения."
+  if (chat.already_nudged) return "После последнего входящего напоминание уже отправлялось."
+  if (!["owner", "assistant"].includes(chat.last_sender)) return "Последняя реплика не от бота или владельца."
+  if (chat.stage === 3 && !unansweredBotReplies(chat.chat_key).some(({ content, message_type: type }) =>
+    type === "invite" || (type === "text" && hasMeetingProposal(content)),
+  )) return "После последнего входящего бот не отправлял приглашение."
+  if (!withinReplyWindow(chat.business_incoming_at)) return "С последнего входящего прошло 24 часа. Окно Telegram закрыто."
+  const hoursToWait = Math.max(
+    NUDGE_AFTER_HOURS - hoursSince(chat.last_at),
+    NUDGE_COOLDOWN_HOURS - hoursSince(chat.nudge_at),
+  )
+  if (hoursToWait > 0) {
+    if (!withinReplyWindow(chat.business_incoming_at, Date.now() + hoursToWait * HOUR_MS)) {
+      return "Срок ожидания закончится после закрытия 24-часового окна Telegram."
+    }
+    const waitMinutes = Math.ceil(hoursToWait * 60)
+    return `До выполнения условий осталось примерно ${waitMinutes} мин.`
+  }
+  if (isQuietTime()) return "Сейчас тихие часы. Ближайшая проверка после 09:00 по Москве."
+  return null
 }
 
 async function runNudge(api, chat) {
@@ -728,27 +765,24 @@ async function runNudge(api, chat) {
 
   try {
     const connection = await api.getBusinessConnection(connectionId)
-    if (!connection.is_enabled || !connection.rights?.can_reply || !eligible()) return false
-    const history = recentMessages(chatKey, BUSINESS_HISTORY)
-    const afterInvite = getStage(chatKey) === 3
-    if (afterInvite) {
-      // Стадия 3 сохраняется после ответа на приглашение. Проверяем,
-      // было ли само приглашение отправлено после последней входящей реплики.
-      const lastIncoming = history.findLastIndex((message) => message.senderType === "user")
-      const unanswered = history.slice(lastIncoming + 1).some((message) =>
-        message.senderType === "assistant" && hasMeetingProposal(message.content),
-      )
-      if (!unanswered) return "skip"
+    if (!connection.is_enabled || !connection.rights?.can_reply) {
+      console.log(`[nudge] ${chatKey}: Business-соединение выключено или нет права отвечать`)
+      return false
     }
+    if (!eligible()) return false
+    const history = recentMessages(chatKey, BUSINESS_HISTORY)
     const prompt = [BUSINESS_SYSTEM_PROMPT, STYLE_PROMPT || FALLBACK_STYLE, nowBlock(), REENGAGE_PROMPT]
-    if (afterInvite) {
+    if (chat.stage === 3) {
       prompt.push("Последнее приглашение осталось без ответа. Не повторяй его и не спрашивай, решила ли она. Если есть повод, вернись к прежней теме.")
     }
     const { answer } = await callWithFallback(history, prompt.join("\n\n"), {
       business: true,
       validate: (text) => text === "[[skip]]" || (isReadyReply(text) && !hasMeetingProposal(text)),
     })
-    if (answer === "[[skip]]") return "skip"
+    if (answer === "[[skip]]") {
+      console.log(`[nudge] ${chatKey}: модель пропустила напоминание для этой паузы`)
+      return "skip"
+    }
     if (!eligible()) return false
 
     await api.sendMessage(chatId, answer, { business_connection_id: connectionId })
@@ -769,11 +803,9 @@ async function nudgeLoop(api, attempts) {
     if (!withinReplyWindow(attempt.incomingAt)) attempts.delete(chatKey)
   }
   for (const chat of quietChats()) {
-    if (!withinReplyWindow(chat.business_incoming_at)) continue
-    if (hoursSince(chat.last_at) < NUDGE_AFTER_HOURS) continue
-    if (hoursSince(nudgeAt(chat.chat_key)) < NUDGE_COOLDOWN_HOURS) continue
     const attempt = attempts.get(chat.chat_key)
     if (attempt?.id === chat.last_id && now < attempt.retryAt) continue
+    if (nudgeWaitReason(chat)) continue
     const result = await runNudge(api, chat)
     if (result === true) attempts.delete(chat.chat_key)
     else attempts.set(chat.chat_key, {
@@ -784,15 +816,15 @@ async function nudgeLoop(api, attempts) {
   }
 }
 
-function startNudgeLoop(api) {
-  if (!ROMANTIC || !ROMANTIC_PROMPT || !REENGAGE_PROMPT || !(NUDGE_AFTER_HOURS > 0)) return
-  if (NUDGE_AFTER_HOURS >= 24) {
-    console.error("[nudge] NUDGE_AFTER_HOURS должен быть меньше 24 часов")
+function startNudgeLoop(api, attempts) {
+  const disabled = nudgeDisabledReason()
+  if (disabled) {
+    console.log("[nudge] выключено.", disabled)
     return
   }
 
+  console.log(`[nudge] включено. Пауза ${NUDGE_AFTER_HOURS} ч, повтор не раньше ${NUDGE_COOLDOWN_HOURS} ч.`)
   let running = false
-  const attempts = new Map()
   const timer = setInterval(async () => {
     if (running) return
     running = true
@@ -833,7 +865,8 @@ function resolveBusinessTarget(ctx) {
 }
 
 export function registerCommands(bot) {
-  startNudgeLoop(bot.api)
+  const nudgeAttempts = new Map()
+  startNudgeLoop(bot.api, nudgeAttempts)
   const pendingBusinessReplies = new Map()
 
   bot.command("start", (ctx) =>
@@ -862,6 +895,7 @@ export function registerCommands(bot) {
         "",
         "Управление переписками (только владельцу):",
         "/chats — список чатов с id",
+        "/nudge_status <id> — причина ожидания напоминания",
         "/stop <id> — выключить бота в чате",
         "/on <id> — включить бота в чате",
       ].join("\n"),
@@ -887,12 +921,37 @@ export function registerCommands(bot) {
         `В этом диалоге: ${messageCount(`${ctx.chat.id}:${ctx.from.id}`)}`,
         `Режим: ${IMPERSONATE ? `от имени ${OWNER_NAME}` : "ИИ-помощник"}`,
         `Романтический стиль Business: ${ROMANTIC && ROMANTIC_PROMPT ? "включён" : "выключен"}`,
-        ROMANTIC && ROMANTIC_PROMPT && REENGAGE_PROMPT && NUDGE_AFTER_HOURS > 0 && NUDGE_AFTER_HOURS < 24
+        !nudgeDisabledReason()
           ? `Сообщение после тишины: от ${NUDGE_AFTER_HOURS} ч, повтор не раньше ${NUDGE_COOLDOWN_HOURS} ч`
           : "Сообщение после тишины: выключено",
         `Уведомления: ${OWNER_TELEGRAM_ID ? `на ${OWNER_TELEGRAM_ID}` : "не настроены"}`,
       ].join("\n"),
     )
+  })
+
+  bot.command("nudge_status", async (ctx) => {
+    if (!isOwner(ctx)) return ctx.reply("Команда только для владельца.")
+    const target = resolveBusinessTarget(ctx)
+    if (!target) return ctx.reply("Укажи id чата из /chats. Например, /nudge_status 123456789")
+    const disabled = nudgeDisabledReason()
+    if (disabled) return ctx.reply(disabled)
+    const chat = nudgeChatState(target)
+    if (!chat) return ctx.reply("Business-чат с таким id не найден.")
+    const reason = nudgeWaitReason(chat)
+    if (reason) return ctx.reply(reason)
+    const attempt = nudgeAttempts.get(target)
+    if (attempt?.id === chat.last_id) {
+      if (attempt.retryAt === Infinity) return ctx.reply("Модель пропустила напоминание для этой паузы.")
+      if (Date.now() < attempt.retryAt) {
+        return ctx.reply("Предыдущая попытка не завершилась отправкой. Причина в логе [nudge].")
+      }
+    }
+    const connection = await ctx.api.getBusinessConnection(chat.business_connection_id).catch(() => null)
+    if (!connection) return ctx.reply("Не удалось проверить Business-соединение в Telegram.")
+    if (!connection.is_enabled || !connection.rights?.can_reply) {
+      return ctx.reply("Business-соединение выключено или у бота нет права отвечать.")
+    }
+    return ctx.reply("Чат подходит для напоминания. Бот проверяет очередь каждую минуту.")
   })
 
   // Показывает ID, на который нужно слать уведомления.
@@ -1168,7 +1227,7 @@ export function registerCommands(bot) {
       if (!reply.text) return
 
       await ctx.api.sendMessage(chatId, reply.text, { business_connection_id: connectionId })
-      addMessage(chatKey, "assistant", reply.text, "business")
+      addMessage(chatKey, "assistant", reply.text, "business", reply.action === "invite" ? "invite" : "text")
       if (reply.action === "invite") setStage(chatKey, 3, "business")
       if (stage < 3 && romantic) {
         if (reply.action === "flirt" && stage !== 2) setStage(chatKey, 2, "business")

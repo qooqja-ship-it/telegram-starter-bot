@@ -342,35 +342,58 @@ export function listChats(limit = 30) {
 // Нужны, чтобы бот сам возобновлял разговор после долгой паузы.
 // Берём включённые Business-чаты после взаимного флирта или приглашения.
 
-const stmtQuietChats = db.prepare(`
+const nudgeChatSelect = `
   SELECT c.chat_key,
          c.business_connection_id,
          c.business_incoming_at,
+         COALESCE(s.enabled, 1) AS enabled,
+         COALESCE(s.stage, 0) AS stage,
+         s.nudge_at,
          m.id AS last_id,
-         m.created_at  AS last_at
+         m.created_at AS last_at,
+         m.sender_type AS last_sender,
+         EXISTS (
+           SELECT 1 FROM messages n
+           WHERE n.chat_id = c.id AND n.message_type = 'nudge' AND n.id > COALESCE((
+             SELECT MAX(id) FROM messages u WHERE u.chat_id = c.id AND u.sender_type = 'user'
+           ), 0)
+         ) AS already_nudged
   FROM chats c
-  JOIN chat_settings s ON s.chat_id = c.id
-  JOIN messages m ON m.id = (
-    SELECT MAX(id) FROM messages WHERE chat_id = c.id
+  LEFT JOIN chat_settings s ON s.chat_id = c.id
+  LEFT JOIN messages m ON m.id = (
+    SELECT MAX(id) FROM messages
+    WHERE chat_id = c.id AND id > COALESCE(s.reset_after_id, 0)
   )
   WHERE c.chat_type = 'business'
-    AND s.enabled = 1
-    AND m.id > s.reset_after_id
-    AND s.stage IN (2, 3)
-    AND c.business_connection_id IS NOT NULL
-    AND m.sender_type IN ('owner', 'assistant')
-    AND m.message_type <> 'nudge'
-    AND NOT EXISTS (
-      SELECT 1 FROM messages n
-      WHERE n.chat_id = c.id AND n.message_type = 'nudge' AND n.id > COALESCE((
-        SELECT MAX(id) FROM messages u WHERE u.chat_id = c.id AND u.sender_type = 'user'
-      ), 0)
-    )
-  ORDER BY m.created_at ASC
+`
+const stmtQuietChats = db.prepare(`
+  SELECT * FROM (${nudgeChatSelect})
+  WHERE enabled = 1 AND stage IN (2, 3) AND business_connection_id IS NOT NULL
+    AND last_sender IN ('owner', 'assistant') AND NOT already_nudged
+  ORDER BY last_at ASC
 `)
+const stmtNudgeChat = db.prepare(`${nudgeChatSelect} AND c.chat_key = ?`)
 
 export function quietChats() {
   return stmtQuietChats.all()
+}
+
+export function nudgeChatState(chatKey) {
+  return stmtNudgeChat.get(chatKey)
+}
+
+const stmtUnansweredBotReplies = db.prepare(`
+  SELECT content, message_type FROM messages
+  WHERE chat_id = @chatId AND sender_type = 'assistant'
+    AND id > MAX(@resetAfterId, COALESCE((
+      SELECT MAX(id) FROM messages WHERE chat_id = @chatId AND sender_type = 'user'
+    ), 0))
+`)
+
+export function unansweredBotReplies(chatKey) {
+  const chatId = chatIdOf(chatKey)
+  if (!chatId) return []
+  return stmtUnansweredBotReplies.all({ chatId, resetAfterId: chatSettings(chatKey).reset_after_id })
 }
 
 // Ключ чата в базе хранится как biz:<id>, наружу отдаём числовой chat id,
@@ -388,13 +411,6 @@ export function markNudge(chatKey, value) {
     INSERT INTO chat_settings (chat_id, nudge_at) VALUES (?, ?)
     ON CONFLICT(chat_id) DO UPDATE SET nudge_at = excluded.nudge_at
   `).run(chatId, value)
-}
-
-export function nudgeAt(chatKey) {
-  const chatId = chatIdOf(chatKey)
-  if (!chatId) return null
-  const row = db.prepare("SELECT nudge_at FROM chat_settings WHERE chat_id = ?").get(chatId)
-  return row?.nudge_at ?? null
 }
 
 // --- Миграция старой истории из conversations.json ---------------------------
