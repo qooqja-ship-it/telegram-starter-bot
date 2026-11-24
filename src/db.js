@@ -340,7 +340,7 @@ export function listChats(limit = 30) {
 
 // --- Молчащие чаты -------------------------------------------------------------
 // Нужны, чтобы бот сам возобновлял разговор после долгой паузы.
-// Берём включённые Business-чаты на этапе взаимного флирта.
+// Берём включённые Business-чаты после взаимного флирта или приглашения.
 
 const stmtQuietChats = db.prepare(`
   SELECT c.chat_key,
@@ -356,7 +356,7 @@ const stmtQuietChats = db.prepare(`
   WHERE c.chat_type = 'business'
     AND s.enabled = 1
     AND m.id > s.reset_after_id
-    AND s.stage = 2
+    AND s.stage IN (2, 3)
     AND c.business_connection_id IS NOT NULL
     AND m.sender_type IN ('owner', 'assistant')
     AND m.message_type <> 'nudge'

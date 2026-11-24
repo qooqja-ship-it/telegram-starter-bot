@@ -55,14 +55,8 @@ const MAX_TOKENS = Number(process.env.MAX_TOKENS) || 0
 // Сколько ждать одну модель и сколько — все попытки вместе.
 // Бюджет должен вмещать хотя бы по одной попытке на каждую модель,
 // иначе резервные так и не получат шанса.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 25_000
-const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 90_000
-const BUSINESS_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 12_000
-const BUSINESS_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 26_000
-
-// Повтор той же модели имеет смысл, только если на него остаётся время
-// и ещё остаётся чем ответить, если повтор тоже не пройдёт.
-const MIN_TIME_AFTER_RETRY_MS = 25_000
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20_000
+const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 60_000
 
 // Пытаемся отключить у модели пошаговое размышление. Прокси, который не
 // понимает поле, просто его проигнорирует.
@@ -416,8 +410,6 @@ async function callModel(model, history, systemPrompt = SYSTEM_PROMPT, hooks = {
 async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {}) {
   const errors = []
   const startedAt = Date.now()
-  const budget = hooks.business ? BUSINESS_BUDGET_MS : TOTAL_BUDGET_MS
-  const timeout = hooks.business ? BUSINESS_TIMEOUT_MS : REQUEST_TIMEOUT_MS
   const messages = hooks.business ? businessHistory(history) : normalize(history)
   const fail = () => {
     throw new Error(`Не ответила ни одна модель. ${errors.join(" Резервная: ")}`)
@@ -427,21 +419,27 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
     const modelsLeft = MODELS.length - index - 1
     const deepseek = /(?:^|\/)deepseek[-/]/i.test(model)
     let maxTokens = MAX_TOKENS || (deepseek ? 1024 : 200)
-    let retried = false
+    const modelStartedAt = Date.now()
+    // В Business оставляем часть бюджета каждой резервной модели.
+    const modelShare = hooks.business
+      ? (TOTAL_BUDGET_MS - (modelStartedAt - startedAt)) / (modelsLeft + 1)
+      : REQUEST_TIMEOUT_MS
+    const modelBudget = Math.min(REQUEST_TIMEOUT_MS, Math.floor(modelShare))
     for (;;) {
       hooks.signal?.throwIfAborted()
-      const remaining = budget - (Date.now() - startedAt)
-      if (remaining <= 0) {
-        errors.push(`${model}: не хватило общего времени (${budget} мс)`)
+      const now = Date.now()
+      const totalRemaining = TOTAL_BUDGET_MS - (now - startedAt)
+      const modelRemaining = modelBudget - (now - modelStartedAt)
+      if (totalRemaining <= 0) {
+        errors.push(`${model}: не хватило общего времени (${TOTAL_BUDGET_MS} мс)`)
         return fail()
       }
-      // В Business оставляем часть бюджета каждой резервной модели.
-      const share = hooks.business ? remaining / (modelsLeft + 1) : remaining
+      if (modelRemaining <= 0) break
       try {
         const answer = await callModel(model, messages, systemPrompt, {
           ...hooks,
           maxTokens,
-          timeoutMs: Math.max(1, Math.min(timeout, Math.floor(share))),
+          timeoutMs: Math.min(totalRemaining, modelRemaining),
         })
         if (hooks.validate && !hooks.validate(answer)) {
           throw new Error("модель вернула черновик или нарушила формат ответа")
@@ -452,37 +450,16 @@ async function callWithFallback(history, systemPrompt = SYSTEM_PROMPT, hooks = {
         return { answer, model }
       } catch (error) {
         hooks.signal?.throwIfAborted()
-        const isTimeout = /время ожидания/.test(error.message)
-        const remaining = budget - (Date.now() - startedAt)
-
-        // Если резервной модели уже нет, один раз увеличиваем штатный
-        // лимит DeepSeek. Явный лимит владельца всегда сохраняется.
+        // Повтор DeepSeek после обрезки использует остаток времени той же модели.
         if (error.finishReason === "length" && !modelsLeft && deepseek &&
-            !MAX_TOKENS && maxTokens === 1024 && remaining > 0) {
+            !MAX_TOKENS && maxTokens === 1024 &&
+            Date.now() - modelStartedAt < modelBudget && Date.now() - startedAt < TOTAL_BUDGET_MS) {
           maxTokens = 2048
           console.log(`[Lareper] ${model}: ответ обрезан, повтор с лимитом ${maxTokens}`)
           continue
         }
 
-        // Повтор разрешаем, только если после него останется время
-        // хотя бы на одну резервную модель. Иначе повтор съест весь
-        // бюджет, как это уже случалось с 45-секундным таймаутом.
-        const canRetry =
-          !hooks.business && isTimeout &&
-          !retried &&
-          remaining > MIN_TIME_AFTER_RETRY_MS &&
-          (modelsLeft === 0 || remaining > REQUEST_TIMEOUT_MS + MIN_TIME_AFTER_RETRY_MS)
-
-        console.error(
-          `[Lareper] ${model} недоступна${canRetry ? " (повтор)" : ""}:`,
-          error.message,
-        )
-
-
-        if (canRetry) {
-          retried = true
-          continue
-        }
+        console.error(`[Lareper] ${model} недоступна:`, error.message)
 
         errors.push(`${model}: ${error.message}`)
 
@@ -745,7 +722,7 @@ async function runNudge(api, chat) {
   const chatId = chatIdFromKey(chatKey)
   if (!chatId) return false
 
-  const eligible = () => isChatEnabled(chatKey) && getStage(chatKey) === 2 &&
+  const eligible = () => isChatEnabled(chatKey) && [2, 3].includes(getStage(chatKey)) &&
     lastMessageId(chatKey) === lastId && withinReplyWindow(chat.business_incoming_at) && !isQuietTime()
   if (!eligible()) return false
 
@@ -753,10 +730,23 @@ async function runNudge(api, chat) {
     const connection = await api.getBusinessConnection(connectionId)
     if (!connection.is_enabled || !connection.rights?.can_reply || !eligible()) return false
     const history = recentMessages(chatKey, BUSINESS_HISTORY)
-    const prompt = [BUSINESS_SYSTEM_PROMPT, STYLE_PROMPT || FALLBACK_STYLE, nowBlock(), REENGAGE_PROMPT].join("\n\n")
-    const { answer } = await callWithFallback(history, prompt, {
+    const afterInvite = getStage(chatKey) === 3
+    if (afterInvite) {
+      // Стадия 3 сохраняется после ответа на приглашение. Проверяем,
+      // было ли само приглашение отправлено после последней входящей реплики.
+      const lastIncoming = history.findLastIndex((message) => message.senderType === "user")
+      const unanswered = history.slice(lastIncoming + 1).some((message) =>
+        message.senderType === "assistant" && hasMeetingProposal(message.content),
+      )
+      if (!unanswered) return "skip"
+    }
+    const prompt = [BUSINESS_SYSTEM_PROMPT, STYLE_PROMPT || FALLBACK_STYLE, nowBlock(), REENGAGE_PROMPT]
+    if (afterInvite) {
+      prompt.push("Последнее приглашение осталось без ответа. Не повторяй его и не спрашивай, решила ли она. Если есть повод, вернись к прежней теме.")
+    }
+    const { answer } = await callWithFallback(history, prompt.join("\n\n"), {
       business: true,
-      validate: (text) => text === "[[skip]]" || isReadyReply(text),
+      validate: (text) => text === "[[skip]]" || (isReadyReply(text) && !hasMeetingProposal(text)),
     })
     if (answer === "[[skip]]") return "skip"
     if (!eligible()) return false
@@ -1111,7 +1101,7 @@ export function registerCommands(bot) {
 
     if (fromOwner || !userText || !isChatEnabled(chatKey) || !connection.rights?.can_reply) return
 
-    const explicitStop = /^(?:стоп|(?:пожалуйста[, ]+)?(?:больше не пиши(?: мне)?|не пиши(?: мне)? больше|перестань мне писать))[!.\s]*$/iu
+    const explicitStop = /^(?:стоп|(?:пожалуйста[, ]+)?(?:больше не пиши(?: мне)?|не пиши(?: мне)?(?: больше)?|перестань(?: мне)? писать))[!.\s]*$/iu
     if (explicitStop.test(userText)) {
       setChatEnabled(chatKey, false, "business")
       return
